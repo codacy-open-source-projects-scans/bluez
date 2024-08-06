@@ -41,6 +41,8 @@
 #define SIOCGSTAMP_OLD SIOCGSTAMP
 #endif
 
+#define MAX_DATA_SIZE 0x40000000
+
 /* Test modes */
 enum {
 	SEND,
@@ -94,7 +96,7 @@ static float tv2fl(struct timeval tv)
 static uint8_t get_channel(const char *svr, uint16_t uuid)
 {
 	sdp_session_t *sdp;
-	sdp_list_t *srch, *attrs, *rsp, *protos;
+	sdp_list_t *srch, *attrs, *rsp, *protos = NULL;
 	uuid_t svclass;
 	uint16_t attr;
 	bdaddr_t dst;
@@ -500,8 +502,9 @@ static void recv_mode(int sk)
 					timestamp = 0;
 					memset(ts, 0, sizeof(ts));
 				} else {
-					sprintf(ts, "[%ld.%ld] ",
-							tv.tv_sec, tv.tv_usec);
+					snprintf(ts, sizeof(ts), "[%lld.%lld] ",
+							(long long)tv.tv_sec,
+							(long long)tv.tv_usec);
 				}
 			}
 
@@ -553,7 +556,8 @@ static void do_send(int sk)
 			exit(1);
 		}
 		len = read(fd, buf, data_size);
-		send(sk, buf, len, 0);
+		if (len > 0)
+			send(sk, buf, len, 0);
 		close(fd);
 		return;
 	} else {
@@ -747,7 +751,8 @@ int main(int argc, char *argv[])
 			break;
 
 		case 'b':
-			data_size = atoi(optarg);
+			if (optarg && atoi(optarg) < MAX_DATA_SIZE)
+				data_size = atoi(optarg);
 			break;
 
 		case 'i':

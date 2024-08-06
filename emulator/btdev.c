@@ -5,6 +5,7 @@
  *
  *  Copyright (C) 2011-2012  Intel Corporation
  *  Copyright (C) 2004-2010  Marcel Holtmann <marcel@holtmann.org>
+ *  Copyright 2023-2024 NXP
  *
  *
  */
@@ -41,6 +42,9 @@
 #define RL_SIZE			16
 #define CIS_SIZE		3
 #define BIS_SIZE		3
+#define CIG_SIZE		3
+
+#define MAX_PA_DATA_LEN	252
 
 #define has_bredr(btdev)	(!((btdev)->features[4] & 0x20))
 #define has_le(btdev)		(!!((btdev)->features[4] & 0x40))
@@ -60,6 +64,7 @@ struct hook {
 
 #define MAX_HOOK_ENTRIES 16
 #define MAX_EXT_ADV_SETS 3
+#define MAX_PENDING_CONN 16
 
 struct btdev_conn {
 	uint16_t handle;
@@ -100,6 +105,12 @@ struct le_ext_adv {
 	unsigned int id;
 };
 
+struct le_cig {
+	struct bt_hci_cmd_le_set_cig_params params;
+	struct bt_hci_cis_params cis[CIS_SIZE];
+	bool activated;
+} __attribute__ ((packed));
+
 struct btdev {
 	enum btdev_type type;
 	uint16_t id;
@@ -137,6 +148,8 @@ struct btdev {
 	uint8_t  feat_page_2[8];
 	uint16_t acl_mtu;
 	uint16_t acl_max_pkt;
+	uint16_t sco_mtu;
+	uint16_t sco_max_pkt;
 	uint16_t iso_mtu;
 	uint16_t iso_max_pkt;
 	uint8_t  country_code;
@@ -198,15 +211,12 @@ struct btdev {
 	uint16_t le_pa_min_interval;
 	uint16_t le_pa_max_interval;
 	uint8_t  le_pa_data_len;
-	uint8_t  le_pa_data[31];
+	uint8_t  le_pa_data[MAX_PA_DATA_LEN];
 	struct bt_hci_cmd_le_pa_create_sync pa_sync_cmd;
 	uint16_t le_pa_sync_handle;
 	uint8_t  big_handle;
 	uint8_t  le_ltk[16];
-	struct {
-		struct bt_hci_cmd_le_set_cig_params params;
-		struct bt_hci_cis_params cis[CIS_SIZE];
-	} __attribute__ ((packed)) le_cig;
+	struct le_cig le_cig[CIG_SIZE];
 	uint8_t  le_iso_path[2];
 
 	/* Real time length of AL array */
@@ -217,6 +227,8 @@ struct btdev {
 	struct btdev_rl le_rl[RL_SIZE];
 	uint8_t  le_rl_enable;
 	uint16_t le_rl_timeout;
+
+	struct btdev *pending_conn[MAX_PENDING_CONN];
 
 	uint8_t le_local_sk256[32];
 
@@ -307,6 +319,18 @@ static inline int del_btdev(struct btdev *btdev)
 	}
 
 	return index;
+}
+
+static inline bool valid_btdev(struct btdev *btdev)
+{
+	int i;
+
+	for (i = 0; i < MAX_BTDEV_ENTRIES; i++) {
+		if (btdev_list[i] == btdev)
+			return true;
+	}
+
+	return false;
 }
 
 static inline struct btdev *find_btdev_by_bdaddr(const uint8_t *bdaddr)
@@ -554,6 +578,8 @@ static void btdev_reset(struct btdev *btdev)
 	btdev->le_scan_enable		= 0x00;
 	btdev->le_adv_enable		= 0x00;
 	btdev->le_pa_enable		= 0x00;
+	btdev->le_pa_sync_handle	= 0x0000;
+	btdev->big_handle		= 0xff;
 
 	al_clear(btdev);
 	rl_clear(btdev);
@@ -629,9 +655,9 @@ static int cmd_read_buffer_size(struct btdev *dev, const void *data,
 
 	rsp.status = BT_HCI_ERR_SUCCESS;
 	rsp.acl_mtu = cpu_to_le16(dev->acl_mtu);
-	rsp.sco_mtu = 0;
+	rsp.sco_mtu = cpu_to_le16(dev->sco_mtu);
 	rsp.acl_max_pkt = cpu_to_le16(dev->acl_max_pkt);
-	rsp.sco_max_pkt = cpu_to_le16(0);
+	rsp.sco_max_pkt = cpu_to_le16(dev->sco_max_pkt);
 
 	cmd_complete(dev, BT_HCI_CMD_READ_BUFFER_SIZE, &rsp, sizeof(rsp));
 
@@ -745,7 +771,9 @@ static int cmd_disconnect_complete(struct btdev *dev, const void *data,
 		return 0;
 	}
 
-	disconnect_complete(dev, conn->handle, BT_HCI_ERR_SUCCESS, cmd->reason);
+	/* Local host has different reason (Core v5.3 Vol 4 Part E Sec 7.1.6) */
+	disconnect_complete(dev, conn->handle, BT_HCI_ERR_SUCCESS,
+						BT_HCI_ERR_LOCAL_HOST_TERM);
 
 	if (conn->link)
 		disconnect_complete(conn->link->dev, conn->link->handle,
@@ -1204,10 +1232,39 @@ static struct btdev_conn *conn_link_bis(struct btdev *dev, struct btdev *remote,
 	return conn;
 }
 
+static void pending_conn_add(struct btdev *btdev, struct btdev *remote)
+{
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(btdev->pending_conn); ++i) {
+		if (!btdev->pending_conn[i]) {
+			btdev->pending_conn[i] = remote;
+			return;
+		}
+	}
+}
+
+static bool pending_conn_del(struct btdev *btdev, struct btdev *remote)
+{
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(btdev->pending_conn); ++i) {
+		if (btdev->pending_conn[i] == remote) {
+			btdev->pending_conn[i] = NULL;
+			return true;
+		}
+	}
+	return false;
+}
+
 static void conn_complete(struct btdev *btdev,
 					const uint8_t *bdaddr, uint8_t status)
 {
 	struct bt_hci_evt_conn_complete cc;
+	struct btdev *remote = find_btdev_by_bdaddr(bdaddr);
+
+	if (!remote)
+		return;
 
 	if (!status) {
 		struct btdev_conn *conn;
@@ -1215,6 +1272,8 @@ static void conn_complete(struct btdev *btdev,
 		conn = conn_add_acl(btdev, bdaddr, BDADDR_BREDR);
 		if (!conn)
 			return;
+
+		pending_conn_del(conn->link->dev, btdev);
 
 		cc.status = status;
 		memcpy(cc.bdaddr, btdev->bdaddr, 6);
@@ -1233,11 +1292,35 @@ static void conn_complete(struct btdev *btdev,
 		cc.link_type = 0x01;
 	}
 
+	pending_conn_del(btdev, remote);
+
 	cc.status = status;
 	memcpy(cc.bdaddr, bdaddr, 6);
 	cc.encr_mode = 0x00;
 
 	send_event(btdev, BT_HCI_EVT_CONN_COMPLETE, &cc, sizeof(cc));
+}
+
+struct page_timeout_data {
+	struct btdev *btdev;
+	uint8_t bdaddr[6];
+	unsigned int timeout_id;
+};
+
+static bool page_timeout(void *user_data)
+{
+	struct page_timeout_data *pt_data = user_data;
+	struct btdev *btdev = pt_data->btdev;
+	const uint8_t *bdaddr = pt_data->bdaddr;
+
+	timeout_remove(pt_data->timeout_id);
+	pt_data->timeout_id = 0;
+
+	if (valid_btdev(btdev))
+		conn_complete(btdev, bdaddr, BT_HCI_ERR_PAGE_TIMEOUT);
+
+	free(pt_data);
+	return false;
 }
 
 static int cmd_create_conn_complete(struct btdev *dev, const void *data,
@@ -1253,9 +1336,22 @@ static int cmd_create_conn_complete(struct btdev *dev, const void *data,
 		memcpy(cr.dev_class, dev->dev_class, 3);
 		cr.link_type = 0x01;
 
+		pending_conn_add(dev, remote);
+
 		send_event(remote, BT_HCI_EVT_CONN_REQUEST, &cr, sizeof(cr));
 	} else {
-		conn_complete(dev, cmd->bdaddr, BT_HCI_ERR_PAGE_TIMEOUT);
+		struct page_timeout_data *pt_data =
+			new0(struct page_timeout_data, 1);
+
+		pt_data->btdev = dev;
+		memcpy(pt_data->bdaddr, cmd->bdaddr, 6);
+
+		/* Send page timeout after 5.12 seconds to emulate real
+		 * paging.
+		 */
+		pt_data->timeout_id = timeout_add(5120,
+						  page_timeout,
+						  pt_data, NULL);
 	}
 
 	return 0;
@@ -1289,16 +1385,24 @@ static int cmd_add_sco_conn(struct btdev *dev, const void *data, uint8_t len)
 	cc.encr_mode = 0x00;
 
 done:
+	pending_conn_del(dev, conn->link->dev);
+
 	send_event(dev, BT_HCI_EVT_CONN_COMPLETE, &cc, sizeof(cc));
 
 	return 0;
 }
 
+static bool match_bdaddr(const void *data, const void *match_data)
+{
+	const struct btdev_conn *conn = data;
+	const uint8_t *bdaddr = match_data;
+
+	return !memcmp(conn->link->dev->bdaddr, bdaddr, 6);
+}
+
 static int cmd_create_conn_cancel(struct btdev *dev, const void *data,
 							uint8_t len)
 {
-	cmd_status(dev, BT_HCI_ERR_SUCCESS, BT_HCI_CMD_CREATE_CONN_CANCEL);
-
 	return 0;
 }
 
@@ -1306,8 +1410,37 @@ static int cmd_create_conn_cancel_complete(struct btdev *dev, const void *data,
 							uint8_t len)
 {
 	const struct bt_hci_cmd_create_conn_cancel *cmd = data;
+	struct bt_hci_rsp_create_conn_cancel rp;
+	struct btdev *remote = find_btdev_by_bdaddr(cmd->bdaddr);
+	struct btdev_conn *conn;
 
-	conn_complete(dev, cmd->bdaddr, BT_HCI_ERR_UNKNOWN_CONN_ID);
+	/* BLUETOOTH CORE SPECIFICATION Version 5.4 | Vol 4, Part E page 1848
+	 *
+	 * If the connection is already established, and the
+	 * HCI_Connection_Complete event has been sent, then the Controller
+	 * shall return an HCI_Command_Complete event with the error code
+	 * Connection Already Exists (0x0B). If the HCI_Create_Connection_Cancel
+	 * command is sent to the Controller without a preceding
+	 * HCI_Create_Connection command to the same device, the BR/EDR
+	 * Controller shall return an HCI_Command_Complete event with the error
+	 * code Unknown Connection Identifier (0x02).
+	 */
+	if (pending_conn_del(dev, remote)) {
+		rp.status = BT_HCI_ERR_SUCCESS;
+	} else {
+		conn = queue_find(dev->conns, match_bdaddr, cmd->bdaddr);
+		if (conn)
+			rp.status = BT_HCI_ERR_CONN_ALREADY_EXISTS;
+		else
+			rp.status = BT_HCI_ERR_UNKNOWN_CONN_ID;
+	}
+
+	memcpy(rp.bdaddr, cmd->bdaddr, sizeof(rp.bdaddr));
+
+	cmd_complete(dev, BT_HCI_CMD_CREATE_CONN_CANCEL, &rp, sizeof(rp));
+
+	if (!rp.status)
+		conn_complete(dev, cmd->bdaddr, BT_HCI_ERR_UNKNOWN_CONN_ID);
 
 	return 0;
 }
@@ -1363,14 +1496,6 @@ static int cmd_link_key_reply(struct btdev *dev, const void *data, uint8_t len)
 	cmd_complete(dev, BT_HCI_CMD_LINK_KEY_REQUEST_REPLY, &rsp, sizeof(rsp));
 
 	return 0;
-}
-
-static bool match_bdaddr(const void *data, const void *match_data)
-{
-	const struct btdev_conn *conn = data;
-	const uint8_t *bdaddr = match_data;
-
-	return !memcmp(conn->link->dev->bdaddr, bdaddr, 6);
 }
 
 static void auth_complete(struct btdev_conn *conn, uint8_t status)
@@ -2614,7 +2739,7 @@ static int cmd_enhanced_setup_sync_conn(struct btdev *dev, const void *data,
 	if (cmd->tx_coding_format[0] > 5)
 		status = BT_HCI_ERR_INVALID_PARAMETERS;
 
-	cmd_status(dev, status, BT_HCI_EVT_SYNC_CONN_COMPLETE);
+	cmd_status(dev, status, BT_HCI_CMD_ENHANCED_SETUP_SYNC_CONN);
 
 	return 0;
 }
@@ -2641,6 +2766,8 @@ static int cmd_enhanced_setup_sync_conn_complete(struct btdev *dev,
 		goto done;
 	}
 
+	/* TODO: HCI_Connection_Request connection flow */
+
 	cc.status = BT_HCI_ERR_SUCCESS;
 	memcpy(cc.bdaddr, conn->link->dev->bdaddr, 6);
 
@@ -2660,7 +2787,7 @@ done:
 
 static int cmd_setup_sync_conn(struct btdev *dev, const void *data, uint8_t len)
 {
-	cmd_status(dev, BT_HCI_ERR_SUCCESS, BT_HCI_EVT_SYNC_CONN_COMPLETE);
+	cmd_status(dev, BT_HCI_ERR_SUCCESS, BT_HCI_CMD_SETUP_SYNC_CONN);
 
 	return 0;
 }
@@ -5106,9 +5233,13 @@ static int cmd_set_pa_data(struct btdev *dev, const void *data,
 {
 	const struct bt_hci_cmd_le_set_pa_data *cmd = data;
 	uint8_t status = BT_HCI_ERR_SUCCESS;
+	uint8_t data_len = cmd->data_len;
 
-	dev->le_pa_data_len = cmd->data_len;
-	memcpy(dev->le_pa_data, cmd->data, 31);
+	if (data_len > MAX_PA_DATA_LEN)
+		data_len = MAX_PA_DATA_LEN;
+
+	dev->le_pa_data_len = data_len;
+	memcpy(dev->le_pa_data, cmd->data, data_len);
 	cmd_complete(dev, BT_HCI_CMD_LE_SET_PA_DATA, &status,
 							sizeof(status));
 
@@ -5154,7 +5285,7 @@ static void send_pa(struct btdev *dev, const struct btdev *remote,
 {
 	struct __packed {
 		struct bt_hci_le_pa_report ev;
-		uint8_t data[31];
+		uint8_t data[247];
 	} pdu;
 
 	memset(&pdu.ev, 0, sizeof(pdu.ev));
@@ -5756,6 +5887,36 @@ static int cmd_read_iso_tx_sync(struct btdev *dev, const void *data,
 	return -ENOTSUP;
 }
 
+static int find_cig(struct btdev *dev, uint8_t cig_id)
+{
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(dev->le_cig); ++i)
+		if (dev->le_cig[i].params.cig_id == cig_id)
+			return i;
+	return -1;
+}
+
+static uint16_t make_cis_handle(uint8_t cig_idx, uint8_t cis_idx)
+{
+	/* Put CIG+CIS idxs to handle so don't need to track separately */
+	return ISO_HANDLE + cig_idx*CIS_SIZE + cis_idx;
+}
+
+static int parse_cis_handle(uint16_t handle, int *cis_idx)
+{
+	int cig_idx;
+
+	if (handle < ISO_HANDLE || handle >= ISO_HANDLE + CIS_SIZE*CIG_SIZE)
+		return -1;
+
+	cig_idx = (handle - ISO_HANDLE) / CIS_SIZE;
+	if (cis_idx)
+		*cis_idx = (handle - ISO_HANDLE) % CIS_SIZE;
+
+	return cig_idx;
+}
+
 static int cmd_set_cig_params(struct btdev *dev, const void *data,
 							uint8_t len)
 {
@@ -5765,12 +5926,15 @@ static int cmd_set_cig_params(struct btdev *dev, const void *data,
 		uint16_t handle[CIS_SIZE];
 	} __attribute__ ((packed)) rsp;
 	int i = 0;
+	int cig_idx;
 	uint32_t interval;
 	uint16_t latency;
 
 	memset(&rsp, 0, sizeof(rsp));
 
-	if (cmd->num_cis > ARRAY_SIZE(dev->le_cig.cis)) {
+	rsp.params.cig_id = cmd->cig_id;
+
+	if (cmd->num_cis > ARRAY_SIZE(dev->le_cig[0].cis)) {
 		rsp.params.status = BT_HCI_ERR_MEM_CAPACITY_EXCEEDED;
 		goto done;
 	}
@@ -5819,38 +5983,34 @@ static int cmd_set_cig_params(struct btdev *dev, const void *data,
 		goto done;
 	}
 
-	if (dev->le_cig.params.cig_id != 0xff &&
-				dev->le_cig.params.cig_id != cmd->cig_id) {
-		rsp.params.status = BT_HCI_ERR_INVALID_PARAMETERS;
+	cig_idx = find_cig(dev, cmd->cig_id);
+	if (cig_idx < 0)
+		cig_idx = find_cig(dev, 0xff);
+	if (cig_idx < 0) {
+		rsp.params.status = BT_HCI_ERR_MEM_CAPACITY_EXCEEDED;
 		goto done;
 	}
 
-	memcpy(&dev->le_cig, data, len);
+	/* BLUETOOTH CORE SPECIFICATION Version 5.3 | Vol 4, Part E
+	 * page 2553
+	 *
+	 * If the Host issues this command when the CIG is not in the
+	 * configurable state, the Controller shall return the error
+	 * code Command Disallowed (0x0C).
+	 */
+	if (dev->le_cig[cig_idx].activated) {
+		rsp.params.status = BT_HCI_ERR_COMMAND_DISALLOWED;
+		goto done;
+	}
 
 	rsp.params.status = BT_HCI_ERR_SUCCESS;
-	rsp.params.cig_id = cmd->cig_id;
 
 	for (i = 0; i < cmd->num_cis; i++) {
-		struct btdev_conn *iso;
-
 		rsp.params.num_handles++;
-		rsp.handle[i] = cpu_to_le16(ISO_HANDLE + i);
-
-		/* BLUETOOTH CORE SPECIFICATION Version 5.3 | Vol 4, Part E
-		 * page 2553
-		 *
-		 * If the Host issues this command when the CIG is not in the
-		 * configurable state, the Controller shall return the error
-		 * code Command Disallowed (0x0C).
-		 */
-		iso = queue_find(dev->conns, match_handle,
-				UINT_TO_PTR(cpu_to_le16(rsp.handle[i])));
-		if (iso) {
-			rsp.params.status = BT_HCI_ERR_INVALID_PARAMETERS;
-			i = 0;
-			goto done;
-		}
+		rsp.handle[i] = cpu_to_le16(make_cis_handle(cig_idx, i));
 	}
+
+	memcpy(&dev->le_cig[cig_idx], data, len);
 
 done:
 	cmd_complete(dev, BT_HCI_CMD_LE_SET_CIG_PARAMS, &rsp,
@@ -5868,43 +6028,106 @@ static int cmd_set_cig_params_test(struct btdev *dev, const void *data,
 
 static int cmd_create_cis(struct btdev *dev, const void *data, uint8_t len)
 {
+	const struct bt_hci_cmd_le_create_cis *cmd = data;
+	int i, j;
+
+	for (i = 0; i < cmd->num_cis; i++) {
+		const struct bt_hci_cis *cis = &cmd->cis[i];
+		struct btdev_conn *acl;
+		struct btdev_conn *iso;
+		int cig_idx, cis_idx;
+
+		/* Check for errors (Core v5.3 Vol 4 Part E Sec. 7.8.99) */
+		for (j = 0; j < i; j++)
+			if (cis->cis_handle == cmd->cis[j].cis_handle)
+				return -EINVAL;
+
+		cig_idx = parse_cis_handle(le16_to_cpu(cis->cis_handle),
+								&cis_idx);
+		if (cig_idx < 0)
+			return -ENOENT;
+		if (cis_idx >= dev->le_cig[cig_idx].params.num_cis)
+			return -ENOENT;
+
+		acl = queue_find(dev->conns, match_handle,
+				 UINT_TO_PTR(le16_to_cpu(cis->acl_handle)));
+		if (!acl)
+			return -ENOENT;
+
+		iso = queue_find(dev->conns, match_handle,
+				 UINT_TO_PTR(le16_to_cpu(cis->cis_handle)));
+		if (iso)
+			return -EEXIST;
+	}
+
 	cmd_status(dev, BT_HCI_ERR_SUCCESS, BT_HCI_CMD_LE_CREATE_CIS);
 
 	return 0;
+}
+
+static uint8_t le_cis_interval(uint8_t sdu_interval[3])
+{
+	/* ISO Interval (slots of 1.25 ms) = SDU_Interval (us) */
+	return get_le24(sdu_interval) / 1250;
+}
+
+static uint32_t le_cis_latecy(uint8_t ft, uint8_t iso_interval,
+					uint8_t sdu_interval[3])
+{
+	uint32_t latency;
+	uint32_t interval = get_le24(sdu_interval);
+
+	/* Transport_Latency = FT × ISO_Interval - SDU_Interval */
+	latency = ft * (iso_interval * 1250) - interval;
+
+	return latency >= interval ? latency : interval;
 }
 
 static void le_cis_estabilished(struct btdev *dev, struct btdev_conn *conn,
 						uint8_t status)
 {
 	struct bt_hci_evt_le_cis_established evt;
+	int cig_idx, cis_idx = -1;
 
 	memset(&evt, 0, sizeof(evt));
 
 	evt.status = status;
 	evt.conn_handle = conn ? cpu_to_le16(conn->handle) : 0x0000;
 
+	cig_idx = conn ? parse_cis_handle(conn->link->handle, &cis_idx) : -1;
+	if (cig_idx < 0 && !evt.status)
+		evt.status = BT_HCI_ERR_UNSPECIFIED_ERROR;
+
 	if (!evt.status) {
 		struct btdev *remote = conn->link->dev;
+		struct le_cig *le_cig = &remote->le_cig[cig_idx];
 
-		/* TODO: Figure out if these values makes sense */
-		memcpy(evt.cig_sync_delay, remote->le_cig.params.c_interval,
-				sizeof(remote->le_cig.params.c_interval));
-		memcpy(evt.cis_sync_delay, remote->le_cig.params.p_interval,
-				sizeof(remote->le_cig.params.p_interval));
-		memcpy(evt.c_latency, &remote->le_cig.params.c_interval,
-				sizeof(remote->le_cig.params.c_interval));
-		memcpy(evt.p_latency, &remote->le_cig.params.p_interval,
-				sizeof(remote->le_cig.params.p_interval));
-		evt.c_phy = remote->le_cig.cis[0].c_phy;
-		evt.p_phy = remote->le_cig.cis[0].p_phy;
+		memset(evt.cig_sync_delay, 0, sizeof(evt.cig_sync_delay));
+		memset(evt.cis_sync_delay, 0, sizeof(evt.cis_sync_delay));
+
+		evt.c_phy = le_cig->cis[cis_idx].c_phy;
+		evt.p_phy = le_cig->cis[cis_idx].p_phy;
 		evt.nse = 0x01;
 		evt.c_bn = 0x01;
 		evt.p_bn = 0x01;
-		evt.c_ft = 0x01;
-		evt.p_ft = 0x01;
-		evt.c_mtu = remote->le_cig.cis[0].c_sdu;
-		evt.p_mtu = remote->le_cig.cis[0].p_sdu;
-		evt.interval = remote->le_cig.params.c_latency;
+		evt.c_ft = 0x02;
+		evt.p_ft = 0x02;
+		evt.c_mtu = le_cig->cis[cis_idx].c_sdu;
+		evt.p_mtu = le_cig->cis[cis_idx].p_sdu;
+		evt.interval = le_cis_interval(le_cig->params.c_interval);
+
+		/* BLUETOOTH CORE SPECIFICATION Version 5.3 | Vol 6, Part G
+		 * page 3050:
+		 *
+		 * Transport_Latency_C_To_P = CIG_Sync_Delay + FT_C_To_P ×
+		 * ISO_Interval - SDU_Interval_C_To_P
+		 * Transport_Latency_P_To_C = CIG_Sync_Delay + FT_P_To_C ×
+		 * ISO_Interval - SDU_Interval_P_To_C
+		 */
+		put_le24(le_cis_latecy(evt.c_ft, evt.interval,
+				le_cig->params.c_interval), evt.c_latency);
+		put_le24(le_cis_latecy(evt.p_ft, evt.interval,
+				le_cig->params.p_interval), evt.p_latency);
 	}
 
 	le_meta_event(dev, BT_HCI_EVT_LE_CIS_ESTABLISHED, &evt, sizeof(evt));
@@ -5925,9 +6148,20 @@ static int cmd_create_cis_complete(struct btdev *dev, const void *data,
 		struct btdev_conn *acl;
 		struct btdev_conn *iso;
 		struct bt_hci_evt_le_cis_req evt;
+		struct le_cig *le_cig;
+		int cig_idx, cis_idx;
+
+		cig_idx = parse_cis_handle(le16_to_cpu(cis->cis_handle),
+								&cis_idx);
+		if (cig_idx < 0) {
+			le_cis_estabilished(dev, NULL,
+						BT_HCI_ERR_UNKNOWN_CONN_ID);
+			break;
+		}
+		le_cig = &dev->le_cig[cig_idx];
 
 		acl = queue_find(dev->conns, match_handle,
-				UINT_TO_PTR(cpu_to_le16(cis->acl_handle)));
+				UINT_TO_PTR(le16_to_cpu(cis->acl_handle)));
 		if (!acl) {
 			le_cis_estabilished(dev, NULL,
 						BT_HCI_ERR_UNKNOWN_CONN_ID);
@@ -5935,9 +6169,9 @@ static int cmd_create_cis_complete(struct btdev *dev, const void *data,
 		}
 
 		iso = queue_find(dev->conns, match_handle,
-				UINT_TO_PTR(cpu_to_le16(cis->cis_handle)));
+				UINT_TO_PTR(le16_to_cpu(cis->cis_handle)));
 		if (!iso) {
-			iso = conn_add_cis(acl, cpu_to_le16(cis->cis_handle));
+			iso = conn_add_cis(acl, le16_to_cpu(cis->cis_handle));
 			if (!iso) {
 				le_cis_estabilished(dev, NULL,
 						BT_HCI_ERR_UNKNOWN_CONN_ID);
@@ -5947,8 +6181,10 @@ static int cmd_create_cis_complete(struct btdev *dev, const void *data,
 
 		evt.acl_handle = cpu_to_le16(acl->handle);
 		evt.cis_handle = cpu_to_le16(iso->handle);
-		evt.cig_id = iso->dev->le_cig.params.cig_id;
-		evt.cis_id = iso->dev->le_cig.cis[0].cis_id;
+		evt.cig_id = le_cig->params.cig_id;
+		evt.cis_id = le_cig->cis[cis_idx].cis_id;
+
+		le_cig->activated = true;
 
 		le_meta_event(iso->link->dev, BT_HCI_EVT_LE_CIS_REQ, &evt,
 					sizeof(evt));
@@ -5957,20 +6193,37 @@ static int cmd_create_cis_complete(struct btdev *dev, const void *data,
 	return 0;
 }
 
+static bool match_handle_cig_idx(const void *data, const void *match_data)
+{
+	const struct btdev_conn *conn = data;
+	int cig_idx = PTR_TO_INT(match_data);
+
+	return cig_idx >= 0 && parse_cis_handle(conn->handle, NULL) == cig_idx;
+}
+
 static int cmd_remove_cig(struct btdev *dev, const void *data, uint8_t len)
 {
 	const struct bt_hci_cmd_le_remove_cig *cmd = data;
 	struct bt_hci_rsp_le_remove_cig rsp;
+	struct btdev_conn *conn = NULL;
+	int idx;
 
-	memset(&dev->le_cig, 0, sizeof(dev->le_cig));
 	memset(&rsp, 0, sizeof(rsp));
 
 	rsp.cig_id = cmd->cig_id;
 
-	if (dev->le_cig.params.cig_id == cmd->cig_id)
+	idx = find_cig(dev, cmd->cig_id);
+	conn = queue_find(dev->conns, match_handle_cig_idx, INT_TO_PTR(idx));
+
+	if (idx >= 0 && !conn) {
+		memset(&dev->le_cig[idx], 0, sizeof(struct le_cig));
+		dev->le_cig[idx].params.cig_id = 0xff;
 		rsp.status = BT_HCI_ERR_SUCCESS;
-	else
+	} else if (conn) {
+		rsp.status = BT_HCI_ERR_COMMAND_DISALLOWED;
+	} else {
 		rsp.status = BT_HCI_ERR_UNKNOWN_CONN_ID;
+	}
 
 	cmd_complete(dev, BT_HCI_CMD_LE_REMOVE_CIG, &rsp, sizeof(rsp));
 
@@ -6028,35 +6281,49 @@ static int cmd_create_big_complete(struct btdev *dev, const void *data,
 	const struct bt_hci_cmd_le_create_big *cmd = data;
 	const struct bt_hci_bis *bis = &cmd->bis;
 	int i;
+	struct bt_hci_evt_le_big_complete evt;
+	uint16_t *bis_handle;
+	uint8_t *pdu;
+	uint8_t pdu_len;
+
+	pdu_len = sizeof(evt) + cmd->num_bis * sizeof(*bis_handle);
+
+	pdu = malloc(pdu_len);
+	if (!pdu)
+		return -ENOMEM;
+
+	bis_handle = (uint16_t *)(pdu + sizeof(evt));
+
+	memset(&evt, 0, sizeof(evt));
 
 	for (i = 0; i < cmd->num_bis; i++) {
 		struct btdev_conn *conn;
-		struct {
-			struct bt_hci_evt_le_big_complete evt;
-			uint16_t handle;
-		} pdu;
 
-		memset(&pdu, 0, sizeof(pdu));
-
-		conn = conn_add_bis(dev, ISO_HANDLE, bis);
+		conn = conn_add_bis(dev, ISO_HANDLE + i, bis);
 		if (!conn) {
-			pdu.evt.status = BT_HCI_ERR_MEM_CAPACITY_EXCEEDED;
+			evt.status = BT_HCI_ERR_MEM_CAPACITY_EXCEEDED;
 			goto done;
 		}
 
-		pdu.evt.handle = cmd->handle;
-		pdu.evt.num_bis++;
-		pdu.evt.phy = bis->phy;
-		pdu.evt.max_pdu = bis->sdu;
-		memcpy(pdu.evt.sync_delay, bis->sdu_interval, 3);
-		memcpy(pdu.evt.latency, bis->sdu_interval, 3);
-		pdu.evt.interval = bis->latency / 1.25;
-		pdu.handle = cpu_to_le16(conn->handle);
+		*bis_handle = cpu_to_le16(conn->handle);
+		bis_handle++;
+	}
+
+	evt.handle = cmd->handle;
+	evt.phy = bis->phy;
+	evt.max_pdu = bis->sdu;
+	memcpy(evt.sync_delay, bis->sdu_interval, 3);
+	memcpy(evt.latency, bis->sdu_interval, 3);
+	evt.interval = bis->latency / 1.25;
+	evt.num_bis = cmd->num_bis;
 
 done:
-		le_meta_event(dev, BT_HCI_EVT_LE_BIG_COMPLETE, &pdu,
-					sizeof(pdu));
-	}
+	memcpy(pdu, &evt, sizeof(evt));
+
+	le_meta_event(dev, BT_HCI_EVT_LE_BIG_COMPLETE, pdu,
+						pdu_len);
+
+	free(pdu);
 
 	return 0;
 }
@@ -6161,6 +6428,13 @@ static int cmd_big_create_sync_complete(struct btdev *dev, const void *data,
 	dev->big_handle = cmd->handle;
 	bis = conn->data;
 
+	if (bis->encryption != cmd->encryption) {
+		pdu.ev.status = BT_HCI_ERR_ENC_MODE_NOT_ACCEPTABLE;
+		le_meta_event(dev, BT_HCI_EVT_LE_BIG_SYNC_ESTABILISHED, &pdu,
+					sizeof(pdu.ev));
+		return 0;
+	}
+
 	pdu.ev.handle = cmd->handle;
 	memcpy(pdu.ev.latency, bis->sdu_interval, sizeof(pdu.ev.interval));
 	pdu.ev.nse = 0x01;
@@ -6210,9 +6484,13 @@ static int cmd_big_term_sync(struct btdev *dev, const void *data, uint8_t len)
 								0x16);
 
 		conn_remove(conn);
+		break;
 	}
 
 done:
+	if (rsp.status == BT_HCI_ERR_SUCCESS)
+		dev->big_handle = 0xff;
+
 	cmd_complete(dev, BT_HCI_CMD_LE_BIG_TERM_SYNC, &rsp, sizeof(rsp));
 
 	return 0;
@@ -6833,6 +7111,7 @@ struct btdev *btdev_create(enum btdev_type type, uint16_t id)
 {
 	struct btdev *btdev;
 	int index;
+	unsigned int i;
 
 	btdev = malloc(sizeof(*btdev));
 	if (!btdev)
@@ -6898,10 +7177,15 @@ struct btdev *btdev_create(enum btdev_type type, uint16_t id)
 	btdev->acl_mtu = 192;
 	btdev->acl_max_pkt = 1;
 
+	btdev->sco_mtu = 72;
+	btdev->sco_max_pkt = 1;
+
 	btdev->iso_mtu = 251;
 	btdev->iso_max_pkt = 1;
-	btdev->le_cig.params.cig_id = 0xff;
 	btdev->big_handle = 0xff;
+
+	for (i = 0; i < ARRAY_SIZE(btdev->le_cig); ++i)
+		btdev->le_cig[i].params.cig_id = 0xff;
 
 	btdev->country_code = 0x00;
 
@@ -6958,6 +7242,16 @@ bool btdev_set_debug(struct btdev *btdev, btdev_debug_func_t callback,
 const uint8_t *btdev_get_bdaddr(struct btdev *btdev)
 {
 	return btdev->bdaddr;
+}
+
+bool btdev_set_bdaddr(struct btdev *btdev, const uint8_t *bdaddr)
+{
+	if (!btdev || !bdaddr)
+		return false;
+
+	memcpy(btdev->bdaddr, bdaddr, sizeof(btdev->bdaddr));
+
+	return true;
 }
 
 uint8_t *btdev_get_features(struct btdev *btdev)
@@ -7051,6 +7345,12 @@ static const struct btdev_cmd *run_cmd(struct btdev *btdev,
 	case -EPERM:
 		status = BT_HCI_ERR_COMMAND_DISALLOWED;
 		break;
+	case -EEXIST:
+		status = BT_HCI_ERR_CONN_ALREADY_EXISTS;
+		break;
+	case -ENOENT:
+		status = BT_HCI_ERR_UNKNOWN_CONN_ID;
+		break;
 	default:
 		status = BT_HCI_ERR_UNSPECIFIED_ERROR;
 		break;
@@ -7065,16 +7365,17 @@ static const struct btdev_cmd *vnd_cmd(struct btdev *btdev, uint8_t op,
 					const struct btdev_cmd *cmd,
 					const void *data, uint8_t len)
 {
+	uint8_t opcode = ((const uint8_t *)data)[0];
+
 	for (; cmd && cmd->func; cmd++) {
-		if (cmd->opcode != ((uint8_t *)data)[0])
+		if (cmd->opcode != opcode)
 			continue;
 
 		return run_cmd(btdev, cmd, data, len);
 	}
 
 	util_debug(btdev->debug_callback, btdev->debug_data,
-			"Unsupported Vendor subcommand 0x%2.2x\n",
-			((uint8_t *)data)[0]);
+			"Unsupported Vendor subcommand 0x%2.2x", opcode);
 
 	cmd_status(btdev, BT_HCI_ERR_UNKNOWN_COMMAND, op);
 
@@ -7100,7 +7401,7 @@ static const struct btdev_cmd *default_cmd(struct btdev *btdev, uint16_t opcode,
 	}
 
 	util_debug(btdev->debug_callback, btdev->debug_data,
-			"Unsupported command 0x%4.4x\n", opcode);
+			"Unsupported command 0x%4.4x", opcode);
 
 	cmd_status(btdev, BT_HCI_ERR_UNKNOWN_COMMAND, opcode);
 
@@ -7288,7 +7589,7 @@ void btdev_receive_h4(struct btdev *btdev, const void *data, uint16_t len)
 		break;
 	default:
 		util_debug(btdev->debug_callback, btdev->debug_data,
-				"Unsupported packet 0x%2.2x\n", pkt_type);
+				"Unsupported packet 0x%2.2x", pkt_type);
 		break;
 	}
 }

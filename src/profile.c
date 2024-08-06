@@ -775,6 +775,18 @@ static struct btd_profile *btd_profile_find_uuid(const char *uuid)
 
 int btd_profile_register(struct btd_profile *profile)
 {
+	if (profile->experimental && !(g_dbus_get_flags() &
+					G_DBUS_FLAG_ENABLE_EXPERIMENTAL)) {
+		DBG("D-Bus experimental not enabled");
+		return -ENOTSUP;
+	}
+
+	if (profile->testing && !(g_dbus_get_flags() &
+					G_DBUS_FLAG_ENABLE_TESTING)) {
+		DBG("D-Bus testing not enabled");
+		return -ENOTSUP;
+	}
+
 	profiles = g_slist_append(profiles, profile);
 	return 0;
 }

@@ -11,7 +11,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
-#include "src/shared/io.h"
+#include <sys/uio.h>
 
 #define data(args...) ((const unsigned char[]) { args })
 
@@ -20,6 +20,8 @@
 		.iov_base = (void *)data(args), \
 		.iov_len = sizeof(data(args)), \
 	}
+
+#define IOV_NULL {}
 
 void tester_init(int *argc, char ***argv);
 int tester_run(void);
@@ -57,6 +59,8 @@ void *tester_get_data(void);
 
 void tester_pre_setup_complete(void);
 void tester_pre_setup_failed(void);
+void tester_pre_setup_abort(void);
+bool tester_pre_setup_skip_by_default(void);
 
 void tester_setup_complete(void);
 void tester_setup_failed(void);
@@ -78,3 +82,4 @@ void tester_wait(unsigned int seconds, tester_wait_func_t func,
 
 struct io *tester_setup_io(const struct iovec *iov, int iovcnt);
 void tester_io_send(void);
+void tester_io_set_complete_func(tester_data_func_t func);

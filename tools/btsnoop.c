@@ -283,7 +283,7 @@ next_packet:
 	if (len < 0 || len != BTSNOOP_PKT_SIZE)
 		goto close_input;
 
-	toread = be32toh(pkt.size);
+	toread = be32toh(pkt.len);
 	flags = be32toh(pkt.flags);
 
 	opcode = flags & 0x00ff;
@@ -356,7 +356,7 @@ next_packet:
 	if (len < 0 || len != BTSNOOP_PKT_SIZE)
 		goto close_input;
 
-	toread = be32toh(pkt.size);
+	toread = be32toh(pkt.len);
 	flags = be32toh(pkt.flags);
 
 	opcode = flags & 0x00ff;
@@ -433,7 +433,7 @@ next_packet:
 	if (len < 0 || len != BTSNOOP_PKT_SIZE)
 		goto close_input;
 
-	toread = be32toh(pkt.size);
+	toread = be32toh(pkt.len);
 
 	len = read(fd, buf, toread);
 	if (len < 0 || len != (ssize_t) toread) {
@@ -448,7 +448,7 @@ next_packet:
 		acl_flags = buf[2] >> 4;
 
 		/* use only packet with ACL start flag */
-		if (acl_flags & 0x02) {
+		if ((acl_flags & 0x02) && len > 9) {
 			if (current_cid == 0x0040 && pdu_len > 0) {
 				int i;
 				if (!pdu_first)
@@ -472,7 +472,7 @@ next_packet:
 			current_cid = buf[8] << 8 | buf[7];
 			memcpy(pdu_buf, buf + 9, len - 9);
 			pdu_len = len - 9;
-		} else if (acl_flags & 0x01) {
+		} else if ((acl_flags & 0x01) && len > 5) {
 			memcpy(pdu_buf + pdu_len, buf + 5, len - 5);
 			pdu_len += len - 5;
 		}

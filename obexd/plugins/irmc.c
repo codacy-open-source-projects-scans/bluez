@@ -419,7 +419,7 @@ static ssize_t irmc_read(void *object, void *buf, size_t count)
 	return len;
 }
 
-static struct obex_mime_type_driver irmc_driver = {
+static const struct obex_mime_type_driver irmc_driver = {
 	.target = IRMC_TARGET,
 	.target_size = IRMC_TARGET_SIZE,
 	.open = irmc_open,
@@ -427,7 +427,7 @@ static struct obex_mime_type_driver irmc_driver = {
 	.read = irmc_read,
 };
 
-static struct obex_service_driver irmc = {
+static const struct obex_service_driver irmc = {
 	.name = "IRMC Sync server",
 	.service = OBEX_IRMC,
 	.target = IRMC_TARGET,

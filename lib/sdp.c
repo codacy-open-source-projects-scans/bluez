@@ -47,7 +47,7 @@
 #define SDPDBG(fmt...)
 #endif
 
-static uint128_t bluetooth_base_uuid = {
+static const uint128_t bluetooth_base_uuid = {
 	.data = {	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00,
 			0x80, 0x00, 0x00, 0x80, 0x5F, 0x9B, 0x34, 0xFB }
 };
@@ -65,10 +65,10 @@ static int sdp_gen_buffer(sdp_buf_t *buf, sdp_data_t *d);
 /* Message structure. */
 struct tupla {
 	int index;
-	char *str;
+	const char *str;
 };
 
-static struct tupla Protocol[] = {
+static const struct tupla Protocol[] = {
 	{ SDP_UUID,		"SDP"		},
 	{ UDP_UUID,		"UDP"		},
 	{ RFCOMM_UUID,		"RFCOMM"	},
@@ -97,7 +97,7 @@ static struct tupla Protocol[] = {
 	{ 0 }
 };
 
-static struct tupla ServiceClass[] = {
+static const struct tupla ServiceClass[] = {
 	{ SDP_SERVER_SVCLASS_ID,		"SDP Server"			},
 	{ BROWSE_GRP_DESC_SVCLASS_ID,		"Browse Group Descriptor"	},
 	{ PUBLIC_BROWSE_GROUP,			"Public Browse Group"		},
@@ -176,9 +176,9 @@ static struct tupla ServiceClass[] = {
 
 #define Profile ServiceClass
 
-static char *string_lookup(struct tupla *pt0, int index)
+static const char *string_lookup(const struct tupla *pt0, int index)
 {
-	struct tupla *pt;
+	const struct tupla *pt;
 
 	for (pt = pt0; pt->index; pt++)
 		if (pt->index == index)
@@ -187,7 +187,8 @@ static char *string_lookup(struct tupla *pt0, int index)
 	return "";
 }
 
-static char *string_lookup_uuid(struct tupla *pt0, const uuid_t *uuid)
+static const char *string_lookup_uuid(const struct tupla *pt0,
+					const uuid_t *uuid)
 {
 	uuid_t tmp_uuid;
 
@@ -209,9 +210,10 @@ static char *string_lookup_uuid(struct tupla *pt0, const uuid_t *uuid)
  * Prints into a string the Protocol UUID
  * coping a maximum of n characters.
  */
-static int uuid2str(struct tupla *message, const uuid_t *uuid, char *str, size_t n)
+static int uuid2str(const struct tupla *message, const uuid_t *uuid, char *str,
+			size_t n)
 {
-	char *str2;
+	const char *str2;
 
 	if (!uuid) {
 		snprintf(str, n, "NULL");
@@ -420,7 +422,7 @@ sdp_data_t *sdp_data_alloc_with_length(uint8_t dtd, const void *value,
 
 		d->unitSize += length;
 		if (length <= USHRT_MAX) {
-			d->val.str = malloc(length);
+			d->val.str = bt_malloc0(length + 1);
 			if (!d->val.str) {
 				free(d);
 				return NULL;
@@ -504,15 +506,17 @@ sdp_data_t *sdp_seq_alloc_with_length(void **dtds, void **values, int *length,
 
 	for (i = 0; i < len; i++) {
 		sdp_data_t *data;
-		int8_t dtd = *(uint8_t *) dtds[i];
+		uint8_t dtd = *(uint8_t *) dtds[i];
 
 		if (dtd >= SDP_SEQ8 && dtd <= SDP_ALT32)
 			data = (sdp_data_t *) values[i];
 		else
 			data = sdp_data_alloc_with_length(dtd, values[i], length[i]);
 
-		if (!data)
+		if (!data) {
+			sdp_data_free(seq);
 			return NULL;
+		}
 
 		if (curr)
 			curr->next = data;
@@ -539,8 +543,10 @@ sdp_data_t *sdp_seq_alloc(void **dtds, void **values, int len)
 		else
 			data = sdp_data_alloc(dtd, values[i]);
 
-		if (!data)
+		if (!data) {
+			sdp_data_free(seq);
 			return NULL;
+		}
 
 		if (curr)
 			curr->next = data;
@@ -575,6 +581,8 @@ int sdp_attr_add(sdp_record_t *rec, uint16_t attr, sdp_data_t *d)
 	sdp_data_t *p = sdp_data_get(rec, attr);
 
 	if (p)
+		return -1;
+	if (!d)
 		return -1;
 
 	d->attrId = attr;
@@ -958,6 +966,8 @@ static void data_seq_free(sdp_data_t *seq)
 
 void sdp_data_free(sdp_data_t *d)
 {
+	if (!d)
+		return;
 	switch (d->dtd) {
 	case SDP_SEQ8:
 	case SDP_SEQ16:
@@ -1505,7 +1515,7 @@ static void *sdp_data_value(sdp_data_t *data, uint32_t *len)
 	case SDP_TEXT_STR32:
 		val = data->val.str;
 		if (len)
-			*len = data->unitSize - 1;
+			*len = data->unitSize - sizeof(uint8_t);
 		break;
 	case SDP_ALT8:
 	case SDP_ALT16:
@@ -1527,10 +1537,15 @@ static sdp_data_t *sdp_copy_seq(sdp_data_t *data)
 	for (tmp = data; tmp; tmp = tmp->next) {
 		sdp_data_t *datatmp;
 		void *value;
+		uint32_t len = 0;
 
-		value = sdp_data_value(tmp, NULL);
-		datatmp = sdp_data_alloc_with_length(tmp->dtd, value,
-								tmp->unitSize);
+		value = sdp_data_value(tmp, &len);
+		datatmp = sdp_data_alloc_with_length(tmp->dtd, value, len);
+
+		if (!datatmp) {
+			sdp_data_free(seq);
+			return NULL;
+		}
 
 		if (cur)
 			cur->next = datatmp;
@@ -2180,16 +2195,21 @@ int sdp_get_int_attr(const sdp_record_t *rec, uint16_t attrid, int *value)
 }
 
 int sdp_get_string_attr(const sdp_record_t *rec, uint16_t attrid, char *value,
-								int valuelen)
+								size_t valuelen)
 {
 	sdp_data_t *sdpdata = sdp_data_get(rec, attrid);
-	if (sdpdata)
-		/* Verify that it is what the caller expects */
-		if (SDP_IS_TEXT_STR(sdpdata->dtd))
-			if ((int) strlen(sdpdata->val.str) < valuelen) {
-				strcpy(value, sdpdata->val.str);
-				return 0;
-			}
+
+	/* Verify that it is what the caller expects */
+	if (!sdpdata || !SDP_IS_TEXT_STR(sdpdata->dtd))
+		goto fail;
+
+	/* Have to copy the NULL terminator too, so check len < valuelen. */
+	if (strlen(sdpdata->val.str) < valuelen) {
+		strcpy(value, sdpdata->val.str);
+		return 0;
+	}
+
+fail:
 	errno = EINVAL;
 	return -1;
 }
@@ -2292,7 +2312,7 @@ static sdp_data_t *access_proto_to_dataseq(sdp_record_t *rec, sdp_list_t *proto)
 	sdp_list_t *p;
 
 	seqlen = sdp_list_len(proto);
-	seqDTDs = malloc(seqlen * sizeof(void *));
+	seqDTDs = bt_malloc0(seqlen * sizeof(void *));
 	if (!seqDTDs)
 		return NULL;
 
@@ -2758,7 +2778,7 @@ uuid_t *sdp_uuid_to_uuid128(const uuid_t *uuid)
  */
 int sdp_uuid128_to_uuid(uuid_t *uuid)
 {
-	uint128_t *b = &bluetooth_base_uuid;
+	const uint128_t *b = &bluetooth_base_uuid;
 	uint128_t *u = &uuid->value.uuid128;
 	uint32_t data;
 	unsigned int i;
@@ -3597,7 +3617,7 @@ sdp_record_t *sdp_service_attr_req(sdp_session_t *session, uint32_t handle,
 	/* get attr seq PDU form */
 	seqlen = gen_attridseq_pdu(pdata, attrids,
 		reqtype == SDP_ATTR_REQ_INDIVIDUAL? SDP_UINT16 : SDP_UINT32);
-	if (seqlen == -1) {
+	if (seqlen < 0) {
 		errno = EINVAL;
 		goto end;
 	}
@@ -3952,7 +3972,7 @@ int sdp_service_attr_async(sdp_session_t *session, uint32_t handle, sdp_attrreq_
 	/* get attr seq PDU form */
 	seqlen = gen_attridseq_pdu(pdata, attrid_list,
 			reqtype == SDP_ATTR_REQ_INDIVIDUAL? SDP_UINT16 : SDP_UINT32);
-	if (seqlen == -1) {
+	if (seqlen < 0) {
 		t->err = EINVAL;
 		goto end;
 	}
@@ -4074,7 +4094,7 @@ int sdp_service_search_attr_async(sdp_session_t *session, const sdp_list_t *sear
 	/* get attr seq PDU form */
 	seqlen = gen_attridseq_pdu(pdata, attrid_list,
 			reqtype == SDP_ATTR_REQ_INDIVIDUAL ? SDP_UINT16 : SDP_UINT32);
-	if (seqlen == -1) {
+	if (seqlen < 0) {
 		t->err = EINVAL;
 		goto end;
 	}
@@ -4458,7 +4478,7 @@ int sdp_service_search_attr_req(sdp_session_t *session, const sdp_list_t *search
 	/* get attr seq PDU form */
 	seqlen = gen_attridseq_pdu(pdata, attrids,
 		reqtype == SDP_ATTR_REQ_INDIVIDUAL ? SDP_UINT16 : SDP_UINT32);
-	if (seqlen == -1) {
+	if (seqlen < 0) {
 		errno = EINVAL;
 		status = -1;
 		goto end;

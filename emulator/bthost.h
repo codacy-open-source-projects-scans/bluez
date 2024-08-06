@@ -5,6 +5,7 @@
  *
  *  Copyright (C) 2011-2012  Intel Corporation
  *  Copyright (C) 2004-2010  Marcel Holtmann <marcel@holtmann.org>
+ *  Copyright 2023-2024 NXP
  *
  *
  */
@@ -44,13 +45,14 @@ typedef void (*bthost_cmd_complete_cb) (uint16_t opcode, uint8_t status,
 void bthost_set_cmd_complete_cb(struct bthost *bthost,
 				bthost_cmd_complete_cb cb, void *user_data);
 
+typedef uint8_t (*bthost_accept_conn_cb) (uint16_t handle, void *user_data);
 typedef void (*bthost_new_conn_cb) (uint16_t handle, void *user_data);
 
 void bthost_set_connect_cb(struct bthost *bthost, bthost_new_conn_cb cb,
 							void *user_data);
 
-void bthost_set_iso_cb(struct bthost *bthost, bthost_new_conn_cb cb,
-							void *user_data);
+void bthost_set_iso_cb(struct bthost *bthost, bthost_accept_conn_cb accept,
+				bthost_new_conn_cb cb, void *user_data);
 
 void bthost_hci_connect(struct bthost *bthost, const uint8_t *bdaddr,
 							uint8_t addr_type);
@@ -78,8 +80,9 @@ void bthost_send_cid(struct bthost *bthost, uint16_t handle, uint16_t cid,
 					const void *data, uint16_t len);
 void bthost_send_cid_v(struct bthost *bthost, uint16_t handle, uint16_t cid,
 					const struct iovec *iov, int iovcnt);
-void bthost_send_iso(struct bthost *bthost, uint16_t handle,
-					const struct iovec *iov, int iovcnt);
+void bthost_send_iso(struct bthost *bthost, uint16_t handle, bool ts,
+			uint16_t sn, uint32_t timestamp, uint8_t pkt_status,
+			const struct iovec *iov, int iovcnt);
 
 typedef void (*bthost_l2cap_rsp_cb) (uint8_t code, const void *data,
 						uint16_t len, void *user_data);
@@ -99,8 +102,12 @@ void bthost_set_ext_adv_data(struct bthost *bthost, const uint8_t *data,
 void bthost_set_ext_adv_params(struct bthost *bthost);
 void bthost_set_ext_adv_enable(struct bthost *bthost, uint8_t enable);
 void bthost_set_pa_params(struct bthost *bthost);
+void bthost_set_pa_data(struct bthost *bthost, const uint8_t *data,
+								uint8_t len);
+void bthost_set_base(struct bthost *bthost, const uint8_t *data, uint8_t len);
 void bthost_set_pa_enable(struct bthost *bthost, uint8_t enable);
-void bthost_create_big(struct bthost *bthost, uint8_t num_bis);
+void bthost_create_big(struct bthost *bthost, uint8_t num_bis, uint8_t enc,
+				const uint8_t *bcode);
 bool bthost_search_ext_adv_addr(struct bthost *bthost, const uint8_t *addr);
 
 void bthost_set_cig_params(struct bthost *bthost, uint8_t cig_id,
@@ -126,6 +133,11 @@ typedef void (*bthost_l2cap_connect_cb) (uint16_t handle, uint16_t cid,
 typedef void (*bthost_l2cap_disconnect_cb) (void *user_data);
 
 void bthost_add_l2cap_server(struct bthost *bthost, uint16_t psm,
+				bthost_l2cap_connect_cb func,
+				bthost_l2cap_disconnect_cb disconn_func,
+				void *user_data);
+void bthost_add_l2cap_server_custom(struct bthost *bthost, uint16_t psm,
+				uint16_t mtu, uint16_t mps, uint16_t credits,
 				bthost_l2cap_connect_cb func,
 				bthost_l2cap_disconnect_cb disconn_func,
 				void *user_data);

@@ -14,6 +14,7 @@
 
 #include <stdlib.h>
 #include <stdbool.h>
+#include <string.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -33,6 +34,7 @@
 #include "emulator/vhci.h"
 #include "emulator/bthost.h"
 #include "emulator/hciemu.h"
+#include "emulator/btdev.h"
 
 #include "src/shared/util.h"
 #include "src/shared/tester.h"
@@ -221,6 +223,32 @@ static void read_info_callback(uint8_t status, uint16_t length,
 	bthost_notify_ready(bthost, tester_pre_setup_complete);
 }
 
+static const uint8_t set_exp_feat_param_mesh[] = {
+	0x76, 0x6e, 0xf3, 0xe8, 0x24, 0x5f, 0x05, 0xbf, /* UUID - Mesh */
+	0x8d, 0x4d, 0x03, 0x7a, 0xd7, 0x63, 0xe4, 0x2c,
+	0x01,						/* Action - enable */
+};
+
+static void mesh_exp_callback(uint8_t status, uint16_t length,
+					const void *param, void *user_data)
+{
+	if (status != MGMT_STATUS_SUCCESS) {
+		tester_print("Mesh feature could not be enabled");
+		return;
+	}
+
+	tester_print("Mesh feature is enabled");
+}
+
+static void mesh_exp_feature(struct test_data *data, uint16_t index)
+{
+	tester_print("Enabling Mesh feature");
+
+	mgmt_send(data->mgmt, MGMT_OP_SET_EXP_FEATURE, index,
+		  sizeof(set_exp_feat_param_mesh), set_exp_feat_param_mesh,
+		  mesh_exp_callback, NULL, NULL);
+}
+
 static void index_added_callback(uint16_t index, uint16_t length,
 					const void *param, void *user_data)
 {
@@ -233,6 +261,10 @@ static void index_added_callback(uint16_t index, uint16_t length,
 
 	mgmt_send(data->mgmt, MGMT_OP_READ_INFO, data->mgmt_index, 0, NULL,
 					read_info_callback, NULL, NULL);
+
+	tester_warn("Enable management Mesh interface");
+	mesh_exp_feature(data, data->mgmt_index);
+
 }
 
 static void index_removed_callback(uint16_t index, uint16_t length,
@@ -258,6 +290,20 @@ static void index_removed_callback(uint16_t index, uint16_t length,
 	tester_post_teardown_complete();
 }
 
+#define MAX_COREDUMP_LINE_LEN	40
+
+struct devcoredump_test_data {
+	enum devcoredump_state {
+		HCI_DEVCOREDUMP_IDLE,
+		HCI_DEVCOREDUMP_ACTIVE,
+		HCI_DEVCOREDUMP_DONE,
+		HCI_DEVCOREDUMP_ABORT,
+		HCI_DEVCOREDUMP_TIMEOUT,
+	} state;
+	unsigned int timeout;
+	char data[MAX_COREDUMP_LINE_LEN];
+};
+
 struct hci_cmd_data {
 	uint16_t opcode;
 	uint8_t len;
@@ -269,6 +315,7 @@ struct hci_entry {
 };
 
 struct generic_data {
+	bdaddr_t *setup_bdaddr;
 	bool setup_le_states;
 	const uint8_t *le_states;
 	const uint16_t *setup_settings;
@@ -329,6 +376,8 @@ struct generic_data {
 	bool set_adv;
 	const uint8_t *adv_data;
 	uint8_t adv_data_len;
+	const struct devcoredump_test_data *dump_data;
+	const char (*expect_dump_data)[MAX_COREDUMP_LINE_LEN];
 };
 
 static const uint8_t set_exp_feat_param_debug[] = {
@@ -386,8 +435,19 @@ static void read_index_list_callback(uint8_t status, uint16_t length,
 	if (tester_use_debug())
 		hciemu_set_debug(data->hciemu, print_debug, "hciemu: ", NULL);
 
+	if (test && test->setup_bdaddr) {
+		struct vhci *vhci = hciemu_get_vhci(data->hciemu);
+		struct btdev *btdev = vhci_get_btdev(vhci);
+
+		if (!btdev_set_bdaddr(btdev, test->setup_bdaddr->b)) {
+			tester_warn("btdev_set_bdaddr failed");
+			tester_pre_setup_failed();
+		}
+	}
+
 	if (test && test->setup_le_states)
 		hciemu_set_central_le_states(data->hciemu, test->le_states);
+
 }
 
 static void test_pre_setup(const void *test_data)
@@ -1628,53 +1688,6 @@ static const struct generic_data set_sc_only_on_success_test_2 = {
 	.expect_hci_len = sizeof(set_sc_on_write_sc_support_param),
 };
 
-static const char set_hs_on_param[] = { 0x01 };
-static const char set_hs_invalid_param[] = { 0x02 };
-static const char set_hs_garbage_param[] = { 0x01, 0x00 };
-static const char set_hs_settings_param_1[] = { 0xc0, 0x01, 0x00, 0x00 };
-
-static const struct generic_data set_hs_on_success_test = {
-	.setup_settings = settings_ssp,
-	.send_opcode = MGMT_OP_SET_HS,
-	.send_param = set_hs_on_param,
-	.send_len = sizeof(set_hs_on_param),
-	.expect_status = MGMT_STATUS_SUCCESS,
-	.expect_param = set_hs_settings_param_1,
-	.expect_len = sizeof(set_hs_settings_param_1),
-	.expect_settings_set = MGMT_SETTING_HS,
-};
-
-static const struct generic_data set_hs_on_invalid_param_test_1 = {
-	.setup_settings = settings_ssp,
-	.send_opcode = MGMT_OP_SET_HS,
-	.expect_status = MGMT_STATUS_INVALID_PARAMS,
-};
-
-static const struct generic_data set_hs_on_invalid_param_test_2 = {
-	.setup_settings = settings_ssp,
-	.send_opcode = MGMT_OP_SET_HS,
-	.send_param = set_hs_invalid_param,
-	.send_len = sizeof(set_hs_invalid_param),
-	.expect_status = MGMT_STATUS_INVALID_PARAMS,
-};
-
-static const struct generic_data set_hs_on_invalid_param_test_3 = {
-	.setup_settings = settings_ssp,
-	.send_opcode = MGMT_OP_SET_HS,
-	.send_param = set_hs_garbage_param,
-	.send_len = sizeof(set_hs_garbage_param),
-	.expect_status = MGMT_STATUS_INVALID_PARAMS,
-};
-
-static const struct generic_data set_hs_on_invalid_index_test = {
-	.setup_settings = settings_ssp,
-	.send_index_none = true,
-	.send_opcode = MGMT_OP_SET_HS,
-	.send_param = set_hs_on_param,
-	.send_len = sizeof(set_hs_on_param),
-	.expect_status = MGMT_STATUS_INVALID_INDEX,
-};
-
 static uint16_t settings_le[] = { MGMT_OP_SET_LE, 0 };
 
 static const char set_le_on_param[] = { 0x01 };
@@ -1826,14 +1839,13 @@ static const char set_adv_set_local_name_param[260] = { 'T', 'e', 's', 't', ' ',
 							'n', 'a', 'm', 'e' };
 
 static const uint8_t set_adv_scan_rsp_data_name_1[] = {
-	0x0c, /* Scan rsp data len */
-	0x0b, /* Local name data len */
+	0x0b, /* Scan rsp data len */
+	0x0a, /* Local name data len */
 	0x09, /* Complete name */
 	0x54, 0x65, 0x73, 0x74, 0x20, 0x6e, 0x61, 0x6d, 0x65, /* "Test name" */
-	0x00, /* null */
 	/* padding */
 	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 };
 
 static const struct generic_data set_adv_on_local_name_test_1 = {
@@ -1866,17 +1878,16 @@ static const struct setup_mgmt_cmd set_advertising_mgmt_cmd_arr[] = {
 };
 
 static const uint8_t set_adv_scan_rsp_data_name_and_appearance[] = {
-	0x10, /* scan rsp data len */
+	0x0f, /* scan rsp data len */
 	0x03, /* appearance data len */
 	0x19, /* eir_appearance */
 	0x54, 0x65, /* appearance value */
-	0x0b, /* local name data len */
+	0x0a, /* local name data len */
 	0x09, /* complete name */
 	0x54, 0x65, 0x73, 0x74, 0x20, 0x6e, 0x61, 0x6d, 0x65, /* "test name" */
-	0x00, /* null */
 	/* padding */
 	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-	0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 };
 
 
@@ -3156,7 +3167,7 @@ static const struct generic_data pair_device_power_off_test_1 = {
 	.send_opcode = MGMT_OP_PAIR_DEVICE,
 	.send_func = pair_device_send_param_func,
 	.force_power_off = true,
-	.expect_status = MGMT_STATUS_NOT_POWERED,
+	.expect_status = MGMT_STATUS_DISCONNECTED,
 	.expect_func = pair_device_expect_param_func,
 };
 
@@ -4024,27 +4035,41 @@ static const struct generic_data unblock_device_invalid_param_test_1 = {
 
 static const char set_static_addr_valid_param[] = {
 			0x11, 0x22, 0x33, 0x44, 0x55, 0xc0 };
-static const char set_static_addr_settings[] = { 0x00, 0x82, 0x00, 0x00 };
+static const char set_static_addr_settings_param[] = { 0x01, 0x82, 0x00, 0x00 };
 
 static const struct generic_data set_static_addr_success_test = {
-	.send_opcode = MGMT_OP_SET_STATIC_ADDRESS,
-	.send_param = set_static_addr_valid_param,
-	.send_len = sizeof(set_static_addr_valid_param),
+	.setup_bdaddr = BDADDR_ANY,
+	.setup_send_opcode = MGMT_OP_SET_STATIC_ADDRESS,
+	.setup_send_param = set_static_addr_valid_param,
+	.setup_send_len = sizeof(set_static_addr_valid_param),
+	.send_opcode = MGMT_OP_SET_POWERED,
+	.send_param = set_powered_on_param,
+	.send_len = sizeof(set_powered_on_param),
 	.expect_status = MGMT_STATUS_SUCCESS,
-	.expect_param = set_static_addr_settings,
-	.expect_len = sizeof(set_static_addr_settings),
+	.expect_param = set_static_addr_settings_param,
+	.expect_len = sizeof(set_static_addr_settings_param),
 	.expect_settings_set = MGMT_SETTING_STATIC_ADDRESS,
+	.expect_hci_command = BT_HCI_CMD_LE_SET_RANDOM_ADDRESS,
+	.expect_hci_param = set_static_addr_valid_param,
+	.expect_hci_len = sizeof(set_static_addr_valid_param),
 };
 
-static const char set_static_addr_settings_dual[] = { 0x80, 0x00, 0x00, 0x00 };
+static const char set_static_addr_settings_dual[] = { 0x81, 0x80, 0x00, 0x00 };
 
 static const struct generic_data set_static_addr_success_test_2 = {
-	.send_opcode = MGMT_OP_SET_STATIC_ADDRESS,
-	.send_param = set_static_addr_valid_param,
-	.send_len = sizeof(set_static_addr_valid_param),
+	.setup_send_opcode = MGMT_OP_SET_STATIC_ADDRESS,
+	.setup_send_param = set_static_addr_valid_param,
+	.setup_send_len = sizeof(set_static_addr_valid_param),
+	.send_opcode = MGMT_OP_SET_POWERED,
+	.send_param = set_powered_on_param,
+	.send_len = sizeof(set_powered_on_param),
 	.expect_status = MGMT_STATUS_SUCCESS,
 	.expect_param = set_static_addr_settings_dual,
 	.expect_len = sizeof(set_static_addr_settings_dual),
+	.expect_settings_set = MGMT_SETTING_STATIC_ADDRESS,
+	.expect_hci_command = BT_HCI_CMD_LE_SET_RANDOM_ADDRESS,
+	.expect_hci_param = set_static_addr_valid_param,
+	.expect_hci_len = sizeof(set_static_addr_valid_param),
 };
 
 static const struct generic_data set_static_addr_failure_test = {
@@ -4606,6 +4631,16 @@ static const struct generic_data remove_device_success_6 = {
 	.expect_param = remove_device_param_all,
 	.expect_len = sizeof(remove_device_param_all),
 	.expect_status = MGMT_STATUS_SUCCESS,
+};
+
+static const struct generic_data add_remove_device_nowait = {
+	.setup_settings = settings_powered_le,
+	.expect_param = remove_device_param_2,
+	.expect_len = sizeof(remove_device_param_2),
+	.expect_status = MGMT_STATUS_SUCCESS,
+	.expect_alt_ev = MGMT_EV_DEVICE_REMOVED,
+	.expect_alt_ev_param = remove_device_param_2,
+	.expect_alt_ev_len = sizeof(remove_device_param_2),
 };
 
 static const struct generic_data read_adv_features_invalid_param_test = {
@@ -5584,7 +5619,7 @@ static const char ext_ctrl_info1[] = {
 	0x00, 0x00, 0x00, 0x01, 0xaa, 0x00, /* btaddr */
 	0x09, /* version */
 	0xf1, 0x05, /* manufacturer */
-	0xff, 0xbf, 0x01, 0x00, /* supported settings */
+	0xff, 0xbe, 0x01, 0x00, /* supported settings */
 	0x80, 0x00, 0x00, 0x00, /* current settings */
 	0x09, 0x00, /* eir length */
 	0x04, /* dev class length */
@@ -5624,7 +5659,7 @@ static const char ext_ctrl_info2[] = {
 	0x00, 0x00, 0x00, 0x01, 0xaa, 0x00, /* btaddr */
 	0x09, /* version */
 	0xf1, 0x05, /* manufacturer */
-	0xff, 0xbf, 0x01, 0x00, /* supported settings */
+	0xff, 0xbe, 0x01, 0x00, /* supported settings */
 	0x81, 0x02, 0x00, 0x00, /* current settings */
 	0x0D, 0x00, /* eir length */
 	0x04, /* dev class length */
@@ -5656,7 +5691,7 @@ static const char ext_ctrl_info3[] = {
 	0x00, 0x00, 0x00, 0x01, 0xaa, 0x00, /* btaddr */
 	0x09, /* version */
 	0xf1, 0x05, /* manufacturer */
-	0xff, 0xbf, 0x01, 0x00, /* supported settings */
+	0xff, 0xbe, 0x01, 0x00, /* supported settings */
 	0x80, 0x02, 0x00, 0x00, /* current settings */
 	0x16, 0x00, /* eir length */
 	0x04, /* dev class length */
@@ -5691,7 +5726,7 @@ static const char ext_ctrl_info4[] = {
 	0x00, 0x00, 0x00, 0x01, 0xaa, 0x00, /* btaddr */
 	0x09, /* version */
 	0xf1, 0x05, /* manufacturer */
-	0xff, 0xbf, 0x01, 0x00, /* supported settings */
+	0xff, 0xbe, 0x01, 0x00, /* supported settings */
 	0x80, 0x02, 0x00, 0x00, /* current settings */
 	0x1a, 0x00, /* eir length */
 	0x04, /* dev class length */
@@ -5745,7 +5780,7 @@ static const char ext_ctrl_info5[] = {
 	0x00, 0x00, 0x00, 0x01, 0xaa, 0x00, /* btaddr */
 	0x09, /* version */
 	0xf1, 0x05, /* manufacturer */
-	0xff, 0xbf, 0x01, 0x00, /* supported settings */
+	0xff, 0xbe, 0x01, 0x00, /* supported settings */
 	0x81, 0x02, 0x00, 0x00, /* current settings */
 	0x1a, 0x00, /* eir len */
 	0x04, /* dev class len */
@@ -5820,8 +5855,8 @@ static const char ext_adv_hci_params_valid[] = {
 static const char ext_adv_params_mgmt_rsp_valid_50[] = {
 	0x01, /* instance */
 	0x00, /* tx_power defaults to 0 on BT5 platform*/
-	0x1f, /* max_adv_data_len */
-	0x1f, /* max_scan_rsp_len */
+	0xfb, /* max_adv_data_len */
+	0xfb, /* max_scan_rsp_len */
 };
 
 static const char ext_adv_params_mgmt_rsp_valid[] = {
@@ -7390,7 +7425,8 @@ static void command_generic_callback(uint8_t status, uint16_t length,
 			expect_param = test->expect_func(&expect_len);
 
 		if (length != expect_len) {
-			tester_warn("Invalid cmd response parameter size");
+			tester_warn("Invalid cmd response parameter size %d %d",
+					length, expect_len);
 			tester_test_failed();
 			return;
 		}
@@ -7640,6 +7676,23 @@ static const uint8_t add_advertising_param_scrsp_data_only_too_long[] = {
 	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 	0x00, 0x00,
 };
 
@@ -7691,6 +7744,29 @@ static const uint8_t add_advertising_param_scrsp_appear_data_too_long[] = {
 	0x1c,			/* scan rsp len */
 	/* adv data: */
 	/* scan rsp data: */
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
@@ -7774,8 +7850,8 @@ static const uint8_t add_advertising_param_name[] = {
 };
 
 static const uint8_t set_scan_rsp_data_name_fits_in_scrsp[] = {
-	0x0c, /* Scan rsp data len */
-	0x0b, /* Local name data len */
+	0x0b, /* Scan rsp data len */
+	0x0a, /* Local name data len */
 	0x09, /* Complete name */
 	0x54, 0x65, 0x73, 0x74, 0x20, 0x6e, 0x61, 0x6d, 0x65, /* "Test name" */
 	/* padding */
@@ -7800,8 +7876,8 @@ static const struct generic_data add_advertising_name_fits_in_scrsp = {
 };
 
 static const uint8_t set_scan_rsp_data_shortened_name_fits[] = {
-	0x0d, /* Scan rsp data len */
-	0x0c, /* Local name data len */
+	0x0c, /* Scan rsp data len */
+	0x0b, /* Local name data len */
 	0x08, /* Short name */
 	0x54, 0x65, 0x73, 0x74, 0x20, 0x6e, 0x61, 0x6d, 0x65, 0x31,
 	/* "Test name1" */
@@ -7827,8 +7903,8 @@ static const struct generic_data add_advertising_shortened_name_in_scrsp = {
 };
 
 static const uint8_t set_scan_rsp_data_short_name_fits[] = {
-	0x07, /* Scan rsp data len */
-	0x06, /* Local name data len */
+	0x06, /* Scan rsp data len */
+	0x05, /* Local name data len */
 	0x08, /* Short name */
 	0x54, 0x65, 0x73, 0x74,
 	/* "Test*/
@@ -7868,16 +7944,16 @@ static const uint8_t add_advertising_param_name_data_ok[] = {
 };
 
 static const uint8_t set_scan_rsp_data_param_name_data_ok[] = {
-	0x1e, /* Scan rsp data len */
+	0x1d, /* Scan rsp data len */
 	/* scan rsp data */
 	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-	0x0b, /* Local name data len */
+	0x0a, /* Local name data len */
 	0x09, /* Complete name */
-	0x54, 0x65, 0x73, 0x74, 0x20, 0x6e, 0x61, 0x6d, 0x65, 0x00,
+	0x54, 0x65, 0x73, 0x74, 0x20, 0x6e, 0x61, 0x6d, 0x65,
 	/* "Test name" */
 	/* padding */
-	0x00,
+	0x00, 0x00,
 };
 
 static const struct generic_data add_advertising_name_data_ok = {
@@ -7905,6 +7981,29 @@ static const uint8_t add_advertising_param_name_data_inv[] = {
 	0x14,			/* scan rsp len */
 	/* adv data: */
 	/* scan rsp data: */
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
 };
@@ -7949,19 +8048,19 @@ static const struct setup_mgmt_cmd add_advertising_mgmt_cmd_arr[] = {
 };
 
 static const uint8_t set_scan_rsp_data_name_data_appear[] = {
-	0x1e, /* Scan rsp data len */
+	0x1d, /* Scan rsp data len */
 	0x03, /* appearance len */
 	0x19, /* EIR_APPEARANCE */
 	0x54, 0x65, /* appearance value */
 	/* scan rsp data */
 	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 	0x00, 0x00, 0x00, 0x00,
-	0x0b, /* Local name data len */
+	0x0a, /* Local name data len */
 	0x09, /* Complete name */
-	0x54, 0x65, 0x73, 0x74, 0x20, 0x6e, 0x61, 0x6d, 0x65, 0x00,
+	0x54, 0x65, 0x73, 0x74, 0x20, 0x6e, 0x61, 0x6d, 0x65,
 	/* "Test name" */
 	/* padding */
-	0x00,
+	0x00, 0x00,
 };
 
 static const struct generic_data add_advertising_name_data_appear = {
@@ -7999,8 +8098,8 @@ static const struct generic_data set_appearance_success = {
 
 static const uint8_t read_adv_features_rsp_3[] =  {
 	0xff, 0xff, 0x01, 0x00,	/* supported flags */
-	0x1f,			/* max_adv_data_len */
-	0x1f,			/* max_scan_rsp_len */
+	0xfb,			/* max_adv_data_len */
+	0xfb,			/* max_scan_rsp_len */
 	0x03,			/* max_instances */
 	0x00,			/* num_instances */
 };
@@ -8650,6 +8749,7 @@ static const struct hci_cmd_data multi_ext_adv_add_second_hci_cmds[] = {
 		.len = sizeof(le_set_ext_adv_enable_inst_2),
 		.param = le_set_ext_adv_enable_inst_2,
 	},
+	{},
 };
 
 static const struct generic_data multi_ext_advertising_add_second_2 = {
@@ -8697,6 +8797,7 @@ static const struct hci_cmd_data multi_ext_adv_remove_adv_hci_cmds[] = {
 		.len = sizeof(advertising_instance1_param),
 		.param = advertising_instance1_param,
 	},
+	{},
 };
 
 static const struct generic_data multi_ext_advertising_remove = {
@@ -8729,6 +8830,7 @@ static const struct hci_cmd_data multi_ext_adv_remove_all_adv_hci_cmds[] = {
 	{
 		.opcode = BT_HCI_CMD_LE_CLEAR_ADV_SETS,
 	},
+	{},
 };
 
 static const struct generic_data multi_ext_advertising_remove_all = {
@@ -8765,6 +8867,7 @@ static const struct hci_cmd_data multi_ext_adv_add_2_advs_hci_cmds[] = {
 		.len = sizeof(set_ext_adv_data_test1),
 		.param = set_ext_adv_data_test1,
 	},
+	{},
 };
 
 static const struct generic_data multi_ext_advertising_add_no_power = {
@@ -8871,11 +8974,11 @@ static const uint8_t set_ext_scan_rsp_data_name_fits_in_scrsp[] = {
 	0x01,				/* handle */
 	0x03,				/* complete data */
 	0x01,				/* controller should not fragment */
-	0x0c, /* Scan rsp data len */
-	0x0b, /* Local name data len */
+	0x0b, /* Scan rsp data len */
+	0x0a, /* Local name data len */
 	0x09, /* Complete name */
 	/* "Test name" */
-	0x54, 0x65, 0x73, 0x74, 0x20, 0x6e, 0x61, 0x6d, 0x65, 0x00,
+	0x54, 0x65, 0x73, 0x74, 0x20, 0x6e, 0x61, 0x6d, 0x65,
 };
 
 static const struct generic_data add_ext_advertising_name_fits_in_scrsp = {
@@ -8898,11 +9001,11 @@ static const uint8_t set_ext_scan_rsp_data_shortened_name_fits[] = {
 	0x01,				/* handle */
 	0x03,				/* complete data */
 	0x01,				/* controller should not fragment */
-	0x0d, /* Scan rsp data len */
-	0x0c, /* Local name data len */
+	0x0c, /* Scan rsp data len */
+	0x0b, /* Local name data len */
 	0x08, /* Short name */
 	/* "Test name1" */
-	0x54, 0x65, 0x73, 0x74, 0x20, 0x6e, 0x61, 0x6d, 0x65, 0x31, 0x00,
+	0x54, 0x65, 0x73, 0x74, 0x20, 0x6e, 0x61, 0x6d, 0x65, 0x31,
 };
 
 static const struct generic_data add_ext_advertising_shortened_name_in_scrsp = {
@@ -8925,13 +9028,13 @@ static const uint8_t set_ext_scan_rsp_data_param_name_data_ok[] = {
 	0x01,				/* handle */
 	0x03,				/* complete data */
 	0x01,				/* controller should not fragment */
-	0x1e, /* Scan rsp data len */
+	0x1d, /* Scan rsp data len */
 	/* scan rsp data */
 	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-	0x0b, /* Local name data len */
+	0x0a, /* Local name data len */
 	0x09, /* Complete name */
-	0x54, 0x65, 0x73, 0x74, 0x20, 0x6e, 0x61, 0x6d, 0x65, 0x00,
+	0x54, 0x65, 0x73, 0x74, 0x20, 0x6e, 0x61, 0x6d, 0x65,
 	/* "Test name" */
 };
 
@@ -8968,16 +9071,16 @@ static const uint8_t set_ext_scan_rsp_data_name_data_appear[] = {
 	0x01,				/* handle */
 	0x03,				/* complete data */
 	0x01,				/* controller should not fragment */
-	0x1e, /* Scan rsp data len */
+	0x1d, /* Scan rsp data len */
 	0x03, /* appearance len */
 	0x19, /* EIR_APPEARANCE */
 	0x54, 0x65, /* appearance value */
 	/* scan rsp data */
 	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 	0x00, 0x00, 0x00, 0x00,
-	0x0b, /* Local name data len */
+	0x0a, /* Local name data len */
 	0x09, /* Complete name */
-	0x54, 0x65, 0x73, 0x74, 0x20, 0x6e, 0x61, 0x6d, 0x65, 0x00,
+	0x54, 0x65, 0x73, 0x74, 0x20, 0x6e, 0x61, 0x6d, 0x65,
 	/* "Test name" */
 };
 
@@ -9370,7 +9473,7 @@ static const struct generic_data add_ext_advertising_conn_off_1m = {
 static const uint8_t get_phy_param[] = {
 	0xff, 0x7f, 0x00, 0x00,	/* All PHYs */
 	0xfe, 0x79,	0x00, 0x00, /* All PHYs except BR 1M 1SLOT, LE 1M TX & LE 1M RX */
-	0xff, 0x07, 0x00, 0x00, /* All BREDR PHYs and LE 1M TX & LE 1M RX */
+	0xff, 0x7f, 0x00, 0x00, /* All PHYs */
 };
 
 static const struct generic_data get_phy_success = {
@@ -9431,26 +9534,6 @@ static const struct generic_data set_phy_coded_success = {
 
 static const uint8_t set_phy_all_param[] = {
 	0xff, 0x7f,	0x00, 0x00	/* All PHYs */
-};
-
-static const uint8_t set_default_phy_all_param[] = {
-	0x00, 		/* preference is there for tx and rx */
-	0x07,		/* 1m 2m coded tx */
-	0x07,		/* 1m 2m coded rx */
-};
-
-static const struct generic_data set_phy_all_success = {
-	.setup_settings = settings_powered_le,
-	.send_opcode = MGMT_OP_SET_PHY_CONFIGURATION,
-	.send_param = set_phy_all_param,
-	.send_len = sizeof(set_phy_all_param),
-	.expect_status = MGMT_STATUS_SUCCESS,
-	.expect_hci_command = BT_HCI_CMD_LE_SET_DEFAULT_PHY,
-	.expect_hci_param = set_default_phy_all_param,
-	.expect_hci_len = sizeof(set_default_phy_all_param),
-	.expect_alt_ev = MGMT_EV_PHY_CONFIGURATION_CHANGED,
-	.expect_alt_ev_param = set_phy_all_param,
-	.expect_alt_ev_len = sizeof(set_phy_all_param),
 };
 
 static const uint8_t set_phy_2m_tx_param[] = {
@@ -9560,13 +9643,16 @@ static const struct generic_data start_discovery_le_ext_scan_enable = {
 	.expect_alt_ev_len = sizeof(start_discovery_le_evt),
 };
 
-static const char start_discovery_valid_ext_scan_param[] = {
+static const char start_discovery_ext_scan_param[] = {
 	0x01,			/* Own Addr type*/
 	0x00,			/* Scan filter policy*/
-	0x01,			/*Phys - 1m */
+	0x05,			/* Phys - 1m and Coded*/
 	0x01,			/* Type */
 	0x12, 0x00,		/* Interval */
 	0x12, 0x00,		/* Window */
+	0x01,			/* Type */
+	0x36, 0x00,		/* Interval */
+	0x36, 0x00,		/* Window */
 };
 
 static const struct generic_data start_discovery_le_ext_scan_param = {
@@ -9578,8 +9664,8 @@ static const struct generic_data start_discovery_le_ext_scan_param = {
 	.expect_param = start_discovery_le_param,
 	.expect_len = sizeof(start_discovery_le_param),
 	.expect_hci_command = BT_HCI_CMD_LE_SET_EXT_SCAN_PARAMS,
-	.expect_hci_param = start_discovery_valid_ext_scan_param,
-	.expect_hci_len = sizeof(start_discovery_valid_ext_scan_param),
+	.expect_hci_param = start_discovery_ext_scan_param,
+	.expect_hci_len = sizeof(start_discovery_ext_scan_param),
 	.expect_alt_ev = MGMT_EV_DISCOVERING,
 	.expect_alt_ev_param = start_discovery_le_evt,
 	.expect_alt_ev_len = sizeof(start_discovery_le_evt),
@@ -9611,6 +9697,15 @@ static const struct generic_data stop_discovery_le_ext_scan_disable = {
 	.expect_alt_ev_len = sizeof(stop_discovery_evt),
 };
 
+static const char start_discovery_2m_ext_scan_param[] = {
+	0x01,			/* Own Addr type*/
+	0x00,			/* Scan filter policy*/
+	0x01,			/* Phys - 1m and Coded*/
+	0x01,			/* Type */
+	0x12, 0x00,		/* Interval */
+	0x12, 0x00,		/* Window */
+};
+
 static const struct generic_data start_discovery_le_2m_scan_param = {
 	.setup_settings = settings_powered_le,
 	.setup_send_opcode = MGMT_OP_SET_PHY_CONFIGURATION,
@@ -9623,8 +9718,8 @@ static const struct generic_data start_discovery_le_2m_scan_param = {
 	.expect_param = start_discovery_bredrle_param,
 	.expect_len = sizeof(start_discovery_bredrle_param),
 	.expect_hci_command = BT_HCI_CMD_LE_SET_EXT_SCAN_PARAMS,
-	.expect_hci_param = start_discovery_valid_ext_scan_param,
-	.expect_hci_len = sizeof(start_discovery_valid_ext_scan_param),
+	.expect_hci_param = start_discovery_2m_ext_scan_param,
+	.expect_hci_len = sizeof(start_discovery_2m_ext_scan_param),
 	.expect_alt_ev = MGMT_EV_DISCOVERING,
 	.expect_alt_ev_param = start_discovery_evt,
 	.expect_alt_ev_len = sizeof(start_discovery_evt),
@@ -9638,8 +9733,8 @@ static const char start_discovery_valid_coded_scan_param[] = {
 	0x12, 0x00,		/* Interval */
 	0x12, 0x00,		/* Window */
 	0x01,			/* Type */
-	0x12, 0x00,		/* Interval */
-	0x12, 0x00,		/* Window */
+	0x36, 0x00,		/* Interval */
+	0x36, 0x00,		/* Window */
 };
 
 static const struct generic_data start_discovery_le_coded_scan_param = {
@@ -9669,8 +9764,8 @@ static const char start_discovery_valid_1m_2m_coded_scan_param[] = {
 	0x12, 0x00,		/* Interval */
 	0x12, 0x00,		/* Window */
 	0x01,			/* Type */
-	0x12, 0x00,		/* Interval */
-	0x12, 0x00,		/* Window */
+	0x36, 0x00,		/* Interval */
+	0x36, 0x00,		/* Window */
 };
 
 static const struct generic_data start_discovery_le_1m_coded_scan_param = {
@@ -9858,7 +9953,7 @@ static const struct generic_data set_dev_flags_fail_3 = {
 };
 
 static const uint8_t read_exp_feat_param_success[] = {
-	0x04, 0x00,				/* Feature Count */
+	0x05, 0x00,				/* Feature Count */
 	0xd6, 0x49, 0xb0, 0xd1, 0x28, 0xeb,	/* UUID - Simultaneous */
 	0x27, 0x92, 0x96, 0x46, 0xc0, 0x42,	/* Central Peripheral */
 	0xb5, 0x10, 0x1b, 0x67,
@@ -9875,6 +9970,10 @@ static const uint8_t read_exp_feat_param_success[] = {
 	0x85, 0x98, 0x6a, 0x49, 0xe0, 0x05,
 	0x88, 0xf1, 0xba, 0x6f,
 	0x00, 0x00, 0x00, 0x00,			/* Flags */
+	0x76, 0x6e, 0xf3, 0xe8, 0x24, 0x5f,	/* UUID - Mesh support */
+	0x05, 0xbf, 0x8d, 0x4d, 0x03, 0x7a,
+	0xd7, 0x63, 0xe4, 0x2c,
+	0x01, 0x00, 0x00, 0x00,			/* Flags */
 };
 
 static const struct generic_data read_exp_feat_success = {
@@ -10234,6 +10333,7 @@ static const struct hci_cmd_data ll_privacy_add_device_3_hci_list[] = {
 		.param = set_resolv_on_param,
 		.len = sizeof(set_resolv_on_param),
 	},
+	{},
 };
 
 static const struct generic_data ll_privacy_add_device_3 = {
@@ -10351,6 +10451,7 @@ static const struct hci_cmd_data ll_privacy_add_device_9_hci_list[] = {
 		.len = sizeof(le_add_to_resolv_list_param),
 		.param = le_add_to_resolv_list_param
 	},
+	{},
 };
 
 static const struct generic_data ll_privacy_add_device_9 = {
@@ -10679,6 +10780,7 @@ static const struct hci_cmd_data ll_privacy_set_device_flags_1_hci_list[] = {
 		.param = set_resolv_on_param,
 		.len = sizeof(set_resolv_on_param),
 	},
+	{},
 };
 
 static const uint8_t device_flags_changed_params_1[] = {
@@ -11344,6 +11446,23 @@ static void test_command_generic(const void *test_data)
 	test_add_condition(data);
 }
 
+static void setup_set_static_addr_success_2(const void *test_data)
+{
+	struct test_data *data = tester_get_data();
+	struct vhci *vhci = hciemu_get_vhci(data->hciemu);
+	int err;
+
+	/* Force use of static address */
+	err = vhci_set_force_static_address(vhci, true);
+	if (err) {
+		tester_warn("Unable to set force_static_address: %s (%d)",
+					strerror(-err), -err);
+		tester_test_failed();
+		return;
+	}
+	setup_command_generic(test_data);
+}
+
 static void check_scan(void *user_data)
 {
 	struct test_data *data = tester_get_data();
@@ -11370,6 +11489,41 @@ static void test_remove_device(const void *test_data)
 	test_command_generic(test_data);
 	tester_wait(1, check_scan, NULL);
 	test_add_condition(data);
+}
+
+static bool hook_delay_cmd(const void *data, uint16_t len, void *user_data)
+{
+	tester_print("Delaying emulator response...");
+	g_usleep(250000);
+	tester_print("Delaying emulator response... Done.");
+	return true;
+}
+
+static void test_add_remove_device_nowait(const void *test_data)
+{
+	struct test_data *data = tester_get_data();
+
+	/* Add and remove LE device with autoconnect without waiting for reply,
+	 * while delaying emulator response to better hit a race condition.
+	 * This shall not crash the kernel (but eg Linux 6.4-rc4 crashes).
+	 */
+
+	tester_print("Adding and removing a device");
+
+	test_add_condition(data);
+
+	hciemu_add_hook(data->hciemu, HCIEMU_HOOK_PRE_CMD,
+					BT_HCI_CMD_LE_ADD_TO_ACCEPT_LIST,
+					hook_delay_cmd, NULL);
+
+	mgmt_send_nowait(data->mgmt, MGMT_OP_ADD_DEVICE, data->mgmt_index,
+				sizeof(add_device_success_param_3),
+				add_device_success_param_3, NULL, NULL, NULL);
+
+	mgmt_send_nowait(data->mgmt, MGMT_OP_REMOVE_DEVICE, data->mgmt_index,
+				sizeof(remove_device_param_2),
+				remove_device_param_2,
+				command_generic_callback, NULL, NULL);
 }
 
 static void trigger_device_found(void *user_data)
@@ -12431,6 +12585,143 @@ static void test_suspend_resume_success_10(const void *test_data)
 	tester_wait(2, trigger_force_resume, NULL);
 }
 
+#define MAX_COREDUMP_BUF_LEN	512
+
+static const struct devcoredump_test_data data_complete_dump = {
+	.state = HCI_DEVCOREDUMP_DONE,
+	.data = "test data",
+};
+
+static const char expected_complete_dump[][MAX_COREDUMP_LINE_LEN] = {
+	"Bluetooth devcoredump",
+	"State: 2",
+	"Controller Name: vhci_ctrl",
+	"Firmware Version: vhci_fw",
+	"Driver: vhci_drv",
+	"Vendor: vhci",
+	"--- Start dump ---",
+	"", /* end of header data */
+};
+
+static const struct generic_data dump_complete = {
+	.dump_data = &data_complete_dump,
+	.expect_dump_data = expected_complete_dump,
+};
+
+static const struct devcoredump_test_data data_abort_dump = {
+	.state = HCI_DEVCOREDUMP_ABORT,
+	.data = "test data",
+};
+
+static const char expected_abort_dump[][MAX_COREDUMP_LINE_LEN] = {
+	"Bluetooth devcoredump",
+	"State: 3",
+	"Controller Name: vhci_ctrl",
+	"Firmware Version: vhci_fw",
+	"Driver: vhci_drv",
+	"Vendor: vhci",
+	"--- Start dump ---",
+	"", /* end of header data */
+};
+
+static const struct generic_data dump_abort = {
+	.dump_data = &data_abort_dump,
+	.expect_dump_data = expected_abort_dump,
+};
+
+static const struct devcoredump_test_data data_timeout_dump = {
+	.state = HCI_DEVCOREDUMP_TIMEOUT,
+	.timeout = 1,
+	.data = "test data",
+};
+
+static const char expected_timeout_dump[][MAX_COREDUMP_LINE_LEN] = {
+	"Bluetooth devcoredump",
+	"State: 4",
+	"Controller Name: vhci_ctrl",
+	"Firmware Version: vhci_fw",
+	"Driver: vhci_drv",
+	"Vendor: vhci",
+	"--- Start dump ---",
+	"", /* end of header data */
+};
+
+static const struct generic_data dump_timeout = {
+	.dump_data = &data_timeout_dump,
+	.expect_dump_data = expected_timeout_dump,
+};
+
+static void verify_devcd(void *user_data)
+{
+	struct test_data *data = tester_get_data();
+	const struct generic_data *test = data->test_data;
+	struct vhci *vhci = hciemu_get_vhci(data->hciemu);
+	char buf[MAX_COREDUMP_BUF_LEN + 1] = {0};
+	int read;
+	char delim[] = "\n";
+	char *line;
+	char *saveptr;
+	int i = 0;
+
+	/* Read the generated devcoredump file */
+	read = vhci_read_devcd(vhci, buf, MAX_COREDUMP_BUF_LEN);
+	if (read <= 0) {
+		tester_warn("Unable to read devcoredump");
+		tester_test_failed();
+		return;
+	}
+	/* Make sure buf is nul-terminated */
+	buf[read] = '\0';
+
+	/* Verify if all devcoredump header fields are present */
+	line = strtok_r(buf, delim, &saveptr);
+	while (strlen(test->expect_dump_data[i])) {
+		if (!line || strcmp(line, test->expect_dump_data[i])) {
+			tester_warn("Incorrect coredump data: %s (expected %s)",
+					line, test->expect_dump_data[i]);
+			tester_test_failed();
+			return;
+		}
+
+		if (!strcmp(strtok(line, ":"), "State")) {
+			/* After updating the devcoredump state, the HCI
+			 * devcoredump API adds a `\0` at the end. Skip it
+			 * before reading the next line.
+			 */
+			saveptr++;
+		}
+
+		line = strtok_r(NULL, delim, &saveptr);
+		i++;
+	}
+
+	/* Verify the devcoredump data */
+	if (!line || strcmp(line, test->dump_data->data)) {
+		tester_warn("Incorrect coredump data: %s (expected %s)", line,
+				test->dump_data->data);
+		tester_test_failed();
+		return;
+	}
+
+	tester_test_passed();
+}
+
+static void test_hci_devcd(const void *test_data)
+{
+	struct test_data *data = tester_get_data();
+	const struct generic_data *test = data->test_data;
+	struct vhci *vhci = hciemu_get_vhci(data->hciemu);
+
+	/* Triggers the devcoredump */
+	if (vhci_force_devcd(vhci, test->dump_data, sizeof(*test->dump_data))) {
+		tester_warn("Unable to set force_devcoredump");
+		tester_test_abort();
+		return;
+	}
+
+	tester_wait(test->dump_data->timeout + 1, verify_devcd, NULL);
+}
+
 int main(int argc, char *argv[])
 {
 	tester_init(&argc, &argv);
@@ -12750,22 +13041,6 @@ int main(int argc, char *argv[])
 				NULL, test_command_generic);
 	test_bredrle("Set Secure Connections Only on - Success 2",
 				&set_sc_only_on_success_test_2,
-				NULL, test_command_generic);
-
-	test_hs("Set High Speed on - Success",
-				&set_hs_on_success_test,
-				NULL, test_command_generic);
-	test_hs("Set High Speed on - Invalid parameters 1",
-				&set_hs_on_invalid_param_test_1,
-				NULL, test_command_generic);
-	test_hs("Set High Speed on - Invalid parameters 2",
-				&set_hs_on_invalid_param_test_2,
-				NULL, test_command_generic);
-	test_hs("Set High Speed on - Invalid parameters 3",
-				&set_hs_on_invalid_param_test_3,
-				NULL, test_command_generic);
-	test_hs("Set High Speed on - Invalid index",
-				&set_hs_on_invalid_index_test,
 				NULL, test_command_generic);
 
 	test_bredrle("Set Low Energy on - Success 1",
@@ -13191,10 +13466,11 @@ int main(int argc, char *argv[])
 
 	test_le("Set Static Address - Success 1",
 				&set_static_addr_success_test,
-				NULL, test_command_generic);
+				setup_command_generic, test_command_generic);
 	test_bredrle("Set Static Address - Success 2",
 				&set_static_addr_success_test_2,
-				NULL, test_command_generic);
+				setup_set_static_addr_success_2,
+				test_command_generic);
 	test_bredrle("Set Static Address - Failure 1",
 				&set_static_addr_failure_test,
 				NULL, test_command_generic);
@@ -13317,6 +13593,10 @@ int main(int argc, char *argv[])
 	test_bredrle50("Remove Device - Success 6 - All Devices",
 				&remove_device_success_6,
 				setup_add_device, test_remove_device);
+
+	test_le("Add + Remove Device Nowait - Success",
+				&add_remove_device_nowait,
+				NULL, test_add_remove_device_nowait);
 
 	test_bredrle("Read Advertising Features - Invalid parameters",
 				&read_adv_features_invalid_param_test,
@@ -13935,9 +14215,6 @@ int main(int argc, char *argv[])
 					NULL, test_command_generic);
 
 	test_bredrle50("Set PHY coded Succcess", &set_phy_coded_success,
-					NULL, test_command_generic);
-
-	test_bredrle50("Set PHY 1m 2m coded Succcess", &set_phy_all_success,
 					NULL, test_command_generic);
 
 	test_bredrle50("Set PHY 2m tx success", &set_phy_2m_tx_success,
@@ -14569,6 +14846,30 @@ int main(int argc, char *argv[])
 				&ll_privacy_set_device_flag_1,
 				setup_ll_privacy_add_device,
 				test_command_generic);
+
+	/* HCI Devcoredump
+	 * Setup : Power on
+	 * Run: Trigger devcoredump via force_devcoredump
+	 * Expect: Devcoredump is generated with correct data
+	 */
+	test_bredrle("HCI Devcoredump - Dump Complete", &dump_complete, NULL,
+			test_hci_devcd);
+
+	/* HCI Devcoredump
+	 * Setup : Power on
+	 * Run: Trigger devcoredump via force_devcoredump
+	 * Expect: Devcoredump is generated with correct data
+	 */
+	test_bredrle("HCI Devcoredump - Dump Abort", &dump_abort, NULL,
+			test_hci_devcd);
+
+	/* HCI Devcoredump
+	 * Setup : Power on
+	 * Run: Trigger devcoredump via force_devcoredump
+	 * Expect: Devcoredump is generated with correct data
+	 */
+	test_bredrle_full("HCI Devcoredump - Dump Timeout", &dump_timeout, NULL,
+				test_hci_devcd, 3);
 
 	return tester_run();
 }

@@ -12,6 +12,7 @@ struct gatt_db;
 struct gatt_db_attribute;
 
 struct gatt_db *gatt_db_new(void);
+struct gatt_db *gatt_db_clone(struct gatt_db *db);
 
 struct gatt_db *gatt_db_ref(struct gatt_db *db);
 void gatt_db_unref(struct gatt_db *db);
@@ -63,6 +64,7 @@ gatt_db_service_add_characteristic(struct gatt_db_attribute *attrib,
 struct gatt_db_attribute *
 gatt_db_service_insert_characteristic(struct gatt_db_attribute *attrib,
 					uint16_t handle,
+					uint16_t value_handle,
 					const bt_uuid_t *uuid,
 					uint32_t permissions,
 					uint8_t properties,
@@ -73,6 +75,7 @@ gatt_db_service_insert_characteristic(struct gatt_db_attribute *attrib,
 struct gatt_db_attribute *
 gatt_db_insert_characteristic(struct gatt_db *db,
 					uint16_t handle,
+					uint16_t value_handle,
 					const bt_uuid_t *uuid,
 					uint32_t permissions,
 					uint8_t properties,
@@ -225,6 +228,9 @@ const bt_uuid_t *gatt_db_attribute_get_type(
 
 uint16_t gatt_db_attribute_get_handle(const struct gatt_db_attribute *attrib);
 
+struct gatt_db_attribute *
+gatt_db_attribute_get_service(const struct gatt_db_attribute *attrib);
+
 bool gatt_db_attribute_get_service_uuid(const struct gatt_db_attribute *attrib,
 							bt_uuid_t *uuid);
 
@@ -281,6 +287,8 @@ bool gatt_db_attribute_write(struct gatt_db_attribute *attrib, uint16_t offset,
 bool gatt_db_attribute_write_result(struct gatt_db_attribute *attrib,
 						unsigned int id, int err);
 
+struct gatt_db_attribute *
+gatt_db_attribute_get_value(struct gatt_db_attribute *attrib);
 struct gatt_db_attribute *
 gatt_db_attribute_get_ccc(struct gatt_db_attribute *attrib);
 

@@ -30,6 +30,7 @@
 
 #include "src/shared/tester.h"
 #include "src/shared/mgmt.h"
+#include "src/shared/util.h"
 
 struct test_data {
 	struct mgmt *mgmt;
@@ -47,6 +48,7 @@ struct test_data {
 struct rfcomm_client_data {
 	uint8_t server_channel;
 	uint8_t client_channel;
+	bool close;
 	int expected_connect_err;
 	const uint8_t *send_data;
 	const uint8_t *read_data;
@@ -297,6 +299,12 @@ const struct rfcomm_client_data connect_success = {
 	.client_channel = 0x0c
 };
 
+const struct rfcomm_client_data connect_close = {
+	.server_channel = 0x0c,
+	.client_channel = 0x0c,
+	.close = true
+};
+
 const uint8_t data[] = {0, 1, 2, 3, 4, 5, 6, 7, 8};
 
 const struct rfcomm_client_data connect_send_success = {
@@ -519,10 +527,26 @@ static gboolean rc_connect_cb(GIOChannel *io, GIOCondition cond,
 		return false;
 	}
 
+	data->io = NULL;
+
 	if (err < 0)
 		tester_test_failed();
 	else
 		tester_test_passed();
+
+	return false;
+}
+
+static gboolean rc_close_cb(GIOChannel *io, GIOCondition cond,
+							gpointer user_data)
+{
+	struct test_data *data = tester_get_data();
+
+	data->io_id = 0;
+
+	tester_print("Closed");
+
+	tester_test_passed();
 
 	return false;
 }
@@ -627,13 +651,20 @@ static void test_connect(const void *test_data)
 	}
 
 	io = g_io_channel_unix_new(sk);
-	g_io_channel_set_close_on_unref(io, TRUE);
-
-	data->io_id = g_io_add_watch(io, G_IO_OUT, rc_connect_cb, NULL);
-
-	g_io_channel_unref(io);
 
 	tester_print("Connect in progress %d", sk);
+
+	if (cli->close) {
+		data->io_id = g_io_add_watch(io, G_IO_NVAL, rc_close_cb, NULL);
+		close(sk);
+		tester_print("Close socket %d", sk);
+	} else {
+		g_io_channel_set_close_on_unref(io, TRUE);
+		data->io_id = g_io_add_watch(io, G_IO_OUT, rc_connect_cb,
+						NULL);
+	}
+
+	g_io_channel_unref(io);
 }
 
 static gboolean server_received_data(GIOChannel *io, GIOCondition cond,
@@ -785,10 +816,8 @@ static void test_server(const void *test_data)
 #define test_rfcomm(name, data, setup, func) \
 	do { \
 		struct test_data *user; \
-		user = malloc(sizeof(struct test_data)); \
-		if (!user) \
-			break; \
-		user->hciemu_type = HCIEMU_TYPE_BREDR; \
+		user = new0(struct test_data, 1); \
+		user->hciemu_type = HCIEMU_TYPE_BREDRLE52; \
 		user->test_data = data; \
 		user->io_id = 0; \
 		tester_add_full(name, data, \
@@ -815,6 +844,9 @@ int main(int argc, char *argv[])
 				test_connect);
 	test_rfcomm("Basic RFCOMM Socket Client - Conn Refused",
 			&connect_nval, setup_powered_client, test_connect);
+	test_rfcomm("Basic RFCOMM Socket Client - Close",
+				&connect_close, setup_powered_client,
+				test_connect);
 	test_rfcomm("Basic RFCOMM Socket Server - Success", &listen_success,
 					setup_powered_server, test_server);
 	test_rfcomm("Basic RFCOMM Socket Server - Write Success",

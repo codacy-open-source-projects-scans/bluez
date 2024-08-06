@@ -41,7 +41,7 @@
 
 struct bluetooth_profile {
 	struct obex_server *server;
-	struct obex_service_driver *driver;
+	const struct obex_service_driver *driver;
 	char *uuid;
 	char *path;
 };
@@ -355,7 +355,7 @@ static void *bluetooth_start(struct obex_server *server, int *err)
 	const GSList *l;
 
 	for (l = server->drivers; l; l = l->next) {
-		struct obex_service_driver *driver = l->data;
+		const struct obex_service_driver *driver = l->data;
 		struct bluetooth_profile *profile;
 		const char *uuid;
 
@@ -416,7 +416,7 @@ static int bluetooth_getsockname(GIOChannel *io, char **name)
 	return 0;
 }
 
-static struct obex_transport_driver driver = {
+static const struct obex_transport_driver driver = {
 	.name = "bluetooth",
 	.start = bluetooth_start,
 	.getpeername = bluetooth_getpeername,

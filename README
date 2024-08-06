@@ -79,6 +79,7 @@ may need to be enabled, and the kernel rebuilt.
 	CONFIG_CRYPTO_USER_API
 	CONFIG_CRYPTO_USER_API_AEAD
 	CONFIG_CRYPTO_USER_API_HASH
+	CONFIG_CRYPTO_USER_API_SKCIPHER
 
 	CONFIG_CRYPTO_AES
 	CONFIG_CRYPTO_CCM
@@ -247,6 +248,19 @@ For a working system, certain configuration options need to be enabled:
 		It is not recommended to enable this option for production
 		systems. The behavior of the deprecated tools may be unstable
 		or simply don't work anymore.
+
+	--enable-external-plugins
+
+		Enable support for external plugins
+
+		By default external plugins for bluetoothd and obexd are not
+		supported and thus disabled.
+
+		External plugins require access to internal, undocumented and
+		unversioned API in said daemons. As such they can break at any
+		time. If you have such plugins, enable this option and work
+		actively with the community to make said plugin part of the
+		upstream bluez project.
 
 	--enable-nfc
 

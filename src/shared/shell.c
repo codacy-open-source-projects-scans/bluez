@@ -4,7 +4,7 @@
  *  BlueZ - Bluetooth protocol stack for Linux
  *
  *  Copyright (C) 2017  Intel Corporation. All rights reserved.
- *
+ *  Copyright 2024 NXP
  *
  */
 
@@ -24,6 +24,7 @@
 #include <sys/signalfd.h>
 #include <wordexp.h>
 #include <getopt.h>
+#include <fcntl.h>
 
 #include <readline/readline.h>
 #include <readline/history.h>
@@ -69,7 +70,12 @@ static struct {
 	bool zsh;
 	bool monitor;
 	int timeout;
-	struct io *input;
+	int init_fd;
+	FILE *f;
+	struct queue *inputs;
+
+	char *line;
+	struct queue *queue;
 
 	bool saved_prompt;
 	bt_shell_prompt_input_func saved_func;
@@ -252,6 +258,120 @@ static void cmd_export(int argc, char *argv[])
 	}
 }
 
+static int bt_shell_queue_exec(char *line)
+{
+	int err;
+
+	/* Queue if already executing */
+	if (data.line) {
+		/* Check if prompt is being held then release using the line */
+		if (!bt_shell_release_prompt(line))
+			return 0;
+		queue_push_tail(data.queue, strdup(line));
+		return 0;
+	}
+
+	bt_shell_printf("%s\n", line);
+
+	err = bt_shell_exec(line);
+	if (!err)
+		data.line = strdup(line);
+
+	return err;
+}
+
+static bool input_read(struct io *io, void *user_data)
+{
+	int fd;
+	char *line = NULL;
+	size_t len = 0;
+	ssize_t nread;
+
+	fd = io_get_fd(io);
+
+	if (fd < 0) {
+		printf("io_get_fd() returned %d\n", fd);
+		return false;
+	}
+
+	if (fd == STDIN_FILENO) {
+		rl_callback_read_char();
+		return true;
+	}
+
+	if (!data.f) {
+		data.f = fdopen(fd, "r");
+		if (!data.f) {
+			printf("fdopen: %s (%d)\n", strerror(errno), errno);
+			return false;
+		}
+	}
+
+	nread = getline(&line, &len, data.f);
+	if (nread > 0) {
+		int err;
+
+		if (line[nread - 1] == '\n')
+			line[nread - 1] = '\0';
+
+		err = bt_shell_queue_exec(line);
+		if (err < 0)
+			printf("%s: %s (%d)\n", line, strerror(-err), -err);
+	} else {
+		fclose(data.f);
+		data.f = NULL;
+	}
+
+	free(line);
+
+	return true;
+}
+
+static bool io_hup(struct io *io, void *user_data)
+{
+	if (queue_remove(data.inputs, io)) {
+		if (!queue_isempty(data.inputs))
+			return false;
+	}
+
+	mainloop_quit();
+
+	return false;
+}
+
+static bool bt_shell_script_attach(int fd)
+{
+	struct io *io;
+
+	io = io_new(fd);
+	if (!io)
+		return false;
+
+	io_set_read_handler(io, input_read, NULL, NULL);
+	io_set_disconnect_handler(io, io_hup, NULL, NULL);
+
+	queue_push_tail(data.inputs, io);
+
+	return true;
+}
+
+static void cmd_script(int argc, char *argv[])
+{
+	int fd;
+
+	fd = open(argv[1], O_RDONLY);
+	if (fd < 0) {
+		printf("Unable to open %s: %s (%d)\n", argv[1],
+						strerror(errno), errno);
+		bt_shell_noninteractive_quit(EXIT_FAILURE);
+		return;
+	}
+
+	printf("Running script %s...\n", argv[1]);
+
+	bt_shell_script_attach(fd);
+}
+
 static const struct bt_shell_menu_entry default_menu[] = {
 	{ "back",         NULL,       cmd_back, "Return to main menu", NULL,
 							NULL, cmd_back_exists },
@@ -265,6 +385,7 @@ static const struct bt_shell_menu_entry default_menu[] = {
 					"Display help about this program" },
 	{ "export",       NULL,       cmd_export,
 						"Print environment variables" },
+	{ "script",       "<filename>", cmd_script, "Run script" },
 	{ }
 };
 
@@ -535,7 +656,7 @@ void bt_shell_printf(const char *fmt, ...)
 	char *saved_line;
 	int saved_point;
 
-	if (!data.input)
+	if (queue_isempty(data.inputs))
 		return;
 
 	if (data.mode) {
@@ -576,6 +697,26 @@ void bt_shell_printf(const char *fmt, ...)
 	}
 }
 
+void bt_shell_echo(const char *fmt, ...)
+{
+	va_list args;
+	char *str;
+	int ret;
+
+	va_start(args, fmt);
+	ret = vasprintf(&str, fmt, args);
+	if (ret >= 0)
+		ret = asprintf(&str, COLOR_HIGHLIGHT "%s " COLOR_OFF "#", str);
+	va_end(args);
+
+	if (ret < 0)
+		return;
+
+	rl_save_prompt();
+	bt_shell_set_prompt(str);
+	rl_restore_prompt();
+}
+
 static void print_string(const char *str, void *user_data)
 {
 	bt_shell_printf("%s\n", str);
@@ -586,13 +727,47 @@ void bt_shell_hexdump(const unsigned char *buf, size_t len)
 	util_hexdump(' ', buf, len, print_string, NULL);
 }
 
-void bt_shell_usage()
+void bt_shell_usage(void)
 {
 	if (!data.exec)
 		return;
 
 	bt_shell_printf("Usage: %s %s\n", data.exec->cmd,
 					data.exec->arg ? data.exec->arg : "");
+}
+
+static void bt_shell_dequeue_exec(void)
+{
+	int err;
+
+	if (!data.line)
+		return;
+
+	free(data.line);
+	data.line = NULL;
+
+	data.line = queue_pop_head(data.queue);
+	if (!data.line)
+		return;
+
+	bt_shell_printf("%s\n", data.line);
+
+	if (!bt_shell_release_prompt(data.line)) {
+		/* If a prompt was released with this line,
+		 * try to release all the other prompts,
+		 * if any are left. Otherwise, the next
+		 * line will be executed on
+		 * bt_shell_noninteractive_quit.
+		 */
+		if (data.saved_prompt)
+			bt_shell_dequeue_exec();
+
+		return;
+	}
+
+	err = bt_shell_exec(data.line);
+	if (err)
+		bt_shell_dequeue_exec();
 }
 
 static void prompt_input(const char *str, bt_shell_prompt_input_func func,
@@ -641,6 +816,13 @@ void bt_shell_prompt_input(const char *label, const char *msg,
 	prompt_input(str, func, user_data);
 
 	free(str);
+
+	if (data.line && !queue_isempty(data.queue))
+		/* If a prompt was set to receive input and
+		 * data is already available, try to execute
+		 * the line and release the prompt.
+		 */
+		bt_shell_dequeue_exec();
 }
 
 static void prompt_free(void *data)
@@ -686,8 +868,6 @@ int bt_shell_release_prompt(const char *input)
 
 static void rl_handler(char *input)
 {
-	HIST_ENTRY *last;
-
 	if (!input) {
 		rl_insert_text("quit");
 		rl_redisplay();
@@ -701,14 +881,6 @@ static void rl_handler(char *input)
 
 	if (!bt_shell_release_prompt(input))
 		goto done;
-
-	last = history_get(history_length + history_base - 1);
-	/* append only if input is different from previous command */
-	if (!last || strcmp(input, last->line))
-		add_history(input);
-
-	if (data.monitor)
-		bt_log_printf(0xffff, data.name, LOG_INFO, "%s", input);
 
 	bt_shell_exec(input);
 
@@ -966,20 +1138,13 @@ static char **shell_completion(const char *text, int start, int end)
 	return matches;
 }
 
-static bool io_hup(struct io *io, void *user_data)
-{
-	mainloop_quit();
-
-	return false;
-}
-
 static void signal_callback(int signum, void *user_data)
 {
 	static bool terminated = false;
 
 	switch (signum) {
 	case SIGINT:
-		if (data.input && !data.mode) {
+		if (!queue_isempty(data.inputs) && !data.mode) {
 			rl_replace_line("", 0);
 			rl_crlf();
 			rl_on_new_line();
@@ -1071,6 +1236,7 @@ static void rl_init(void)
 static const struct option main_options[] = {
 	{ "version",	no_argument, 0, 'v' },
 	{ "help",	no_argument, 0, 'h' },
+	{ "init-script", required_argument, 0, 's' },
 	{ "timeout",	required_argument, 0, 't' },
 	{ "monitor",	no_argument, 0, 'm' },
 	{ "zsh-complete",	no_argument, 0, 'z' },
@@ -1092,6 +1258,7 @@ static void usage(int argc, char **argv, const struct bt_shell_opt *opt)
 	printf("\t--monitor \tEnable monitor output\n"
 		"\t--timeout \tTimeout in seconds for non-interactive mode\n"
 		"\t--version \tDisplay version\n"
+		"\t--init-script \tInit script file\n"
 		"\t--help \t\tDisplay help\n");
 }
 
@@ -1101,6 +1268,7 @@ void bt_shell_init(int argc, char **argv, const struct bt_shell_opt *opt)
 	struct option options[256];
 	char optstr[256];
 	size_t offset;
+	char *endptr = NULL;
 
 	offset = sizeof(main_options) / sizeof(struct option);
 
@@ -1109,15 +1277,17 @@ void bt_shell_init(int argc, char **argv, const struct bt_shell_opt *opt)
 	if (opt) {
 		memcpy(options + offset, opt->options,
 				sizeof(struct option) * opt->optno);
-		snprintf(optstr, sizeof(optstr), "+mhvt:%s", opt->optstr);
+		snprintf(optstr, sizeof(optstr), "+mhvs:t:%s", opt->optstr);
 	} else
-		snprintf(optstr, sizeof(optstr), "+mhvt:");
+		snprintf(optstr, sizeof(optstr), "+mhvs:t:");
 
 	data.name = strrchr(argv[0], '/');
 	if (!data.name)
 		data.name = strdup(argv[0]);
 	else
 		data.name = strdup(++data.name);
+
+	data.init_fd = -1;
 
 	while ((c = getopt_long(argc, argv, optstr, options, &index)) != -1) {
 		switch (c) {
@@ -1131,8 +1301,20 @@ void bt_shell_init(int argc, char **argv, const struct bt_shell_opt *opt)
 			data.argv = &cmplt;
 			data.mode = 1;
 			goto done;
+		case 's':
+			if (optarg && data.init_fd < 0) {
+				data.init_fd = open(optarg, O_RDONLY);
+				if (data.init_fd < 0)
+					printf("Unable to open %s: %s (%d)\n",
+						optarg, strerror(errno), errno);
+			}
+			break;
 		case 't':
-			data.timeout = atoi(optarg);
+			if (optarg)
+				data.timeout = strtol(optarg, &endptr, 0);
+
+			if (!endptr || *endptr != '\0')
+				printf("Unable to parse timeout\n");
 			break;
 		case 'z':
 			data.zsh = 1;
@@ -1152,13 +1334,15 @@ void bt_shell_init(int argc, char **argv, const struct bt_shell_opt *opt)
 				}
 			}
 
-			if (c != opt->options[index - offset].val) {
-				usage(argc, argv, opt);
-				exit(EXIT_SUCCESS);
-				return;
-			}
+			if (opt && index >= 0 && (size_t)index >= offset) {
+				if (c != opt->options[index - offset].val) {
+					usage(argc, argv, opt);
+					exit(EXIT_SUCCESS);
+					return;
+				}
 
-			*opt->optarg[index - offset] = optarg;
+				*opt->optarg[index - offset] = optarg ? : "";
+			}
 		}
 
 		index = -1;
@@ -1180,6 +1364,8 @@ done:
 	rl_init();
 
 	data.init = true;
+	data.inputs = queue_new();
+	data.queue = queue_new();
 	data.prompts = queue_new();
 }
 
@@ -1216,14 +1402,35 @@ int bt_shell_run(void)
 
 int bt_shell_exec(const char *input)
 {
+	HIST_ENTRY *last;
 	wordexp_t w;
 	int err;
 
 	if (!input)
 		return 0;
 
-	if (wordexp(input, &w, WRDE_NOCMD))
-		return -ENOEXEC;
+	last = history_get(history_length + history_base - 1);
+	/* append only if input is different from previous command */
+	if (!last || strcmp(input, last->line))
+		add_history(input);
+
+	if (data.monitor)
+		bt_log_printf(0xffff, data.name, LOG_INFO, "%s", input);
+
+	err = wordexp(input, &w, WRDE_NOCMD);
+	switch (err) {
+	case WRDE_BADCHAR:
+		return -EBADMSG;
+	case WRDE_BADVAL:
+	case WRDE_SYNTAX:
+		return -EINVAL;
+	case WRDE_NOSPACE:
+		return -ENOMEM;
+	case WRDE_CMDSUB:
+		if (wordexp(input, &w, 0))
+			return -ENOEXEC;
+		break;
+	};
 
 	if (w.we_wordc == 0) {
 		wordfree(&w);
@@ -1252,6 +1459,10 @@ void bt_shell_cleanup(void)
 
 	rl_cleanup();
 
+	queue_destroy(data.inputs, NULL);
+	data.inputs = NULL;
+	queue_destroy(data.queue, free);
+	data.queue = NULL;
 	queue_destroy(data.prompts, prompt_free);
 	data.prompts = NULL;
 
@@ -1269,8 +1480,10 @@ void bt_shell_quit(int status)
 
 void bt_shell_noninteractive_quit(int status)
 {
-	if (!data.mode || data.timeout)
+	if (!data.mode || data.timeout) {
+		bt_shell_dequeue_exec();
 		return;
+	}
 
 	bt_shell_quit(status);
 }
@@ -1306,17 +1519,19 @@ bool bt_shell_add_submenu(const struct bt_shell_menu *menu)
 
 void bt_shell_set_prompt(const char *string)
 {
+	char *prompt;
+
 	if (!data.init || data.mode)
 		return;
 
-	rl_set_prompt(string);
-	rl_redisplay();
-}
+	if (asprintf(&prompt, "\001%s\002", string) < 0)
+		rl_set_prompt(string);
+	else {
+		rl_set_prompt(prompt);
+		free(prompt);
+	}
 
-static bool input_read(struct io *io, void *user_data)
-{
-	rl_callback_read_char();
-	return true;
+	rl_redisplay();
 }
 
 static bool shell_quit(void *data)
@@ -1330,18 +1545,16 @@ bool bt_shell_attach(int fd)
 {
 	struct io *io;
 
-	/* TODO: Allow more than one input? */
-	if (data.input)
-		return false;
-
 	io = io_new(fd);
+	if (!io)
+		return false;
 
 	if (!data.mode) {
 		io_set_read_handler(io, input_read, NULL, NULL);
 		io_set_disconnect_handler(io, io_hup, NULL, NULL);
 	}
 
-	data.input = io;
+	queue_push_tail(data.inputs, io);
 
 	if (data.mode) {
 		if (shell_exec(data.argc, data.argv) < 0) {
@@ -1352,6 +1565,12 @@ bool bt_shell_attach(int fd)
 		if (data.timeout)
 			timeout_add(data.timeout * 1000, shell_quit, NULL,
 								NULL);
+	} else if (data.init_fd >= 0) {
+		int fd = data.init_fd;
+
+		data.init_fd = -1;
+		if (!bt_shell_attach(fd))
+			return false;
 	}
 
 	return true;
@@ -1359,11 +1578,11 @@ bool bt_shell_attach(int fd)
 
 bool bt_shell_detach(void)
 {
-	if (!data.input)
+	if (queue_isempty(data.inputs))
 		return false;
 
-	io_destroy(data.input);
-	data.input = NULL;
+	queue_remove_all(data.inputs, NULL, NULL,
+					(queue_destroy_func_t) io_destroy);
 
 	return true;
 }

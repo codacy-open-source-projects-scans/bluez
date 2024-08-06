@@ -34,6 +34,7 @@
 
 #include "src/shared/mainloop.h"
 #include "src/shared/util.h"
+#include "src/shared/io.h"
 #include "src/shared/tester.h"
 #include "src/shared/log.h"
 #include "src/shared/timeout.h"
@@ -88,6 +89,7 @@ struct test_case {
 	tester_data_func_t test_func;
 	tester_data_func_t teardown_func;
 	tester_data_func_t post_teardown_func;
+	tester_data_func_t io_complete_func;
 	gdouble start_time;
 	gdouble end_time;
 	unsigned int timeout;
@@ -561,6 +563,38 @@ void tester_pre_setup_failed(void)
 	g_idle_add(done_callback, test);
 }
 
+void tester_pre_setup_abort(void)
+{
+	struct test_case *test;
+
+	if (!test_current)
+		return;
+
+	test = test_current->data;
+
+	if (test->stage != TEST_STAGE_PRE_SETUP)
+		return;
+
+	if (test->timeout_id > 0) {
+		timeout_remove(test->timeout_id);
+		test->timeout_id = 0;
+	}
+
+	print_progress(test->name, COLOR_YELLOW, "not run");
+
+	g_idle_add(done_callback, test);
+}
+
+bool tester_pre_setup_skip_by_default(void)
+{
+	if (!option_prefix && !option_string) {
+		tester_pre_setup_abort();
+		return true;
+	}
+
+	return false;
+}
+
 void tester_setup_complete(void)
 {
 	struct test_case *test;
@@ -619,6 +653,9 @@ static void test_result(enum test_result result)
 		timeout_remove(test->timeout_id);
 		test->timeout_id = 0;
 	}
+
+	if (test->result == TEST_RESULT_FAILED)
+		result = TEST_RESULT_FAILED;
 
 	test->result = result;
 	switch (result) {
@@ -912,6 +949,13 @@ static bool test_io_send(struct io *io, void *user_data)
 
 	g_assert_cmpint(len, ==, iov->iov_len);
 
+	if (!test->iovcnt && test->io_complete_func) {
+		test->io_complete_func(test->test_data);
+	} else if (test->iovcnt && !test->iov->iov_base) {
+		test_get_iov(test);
+		return test_io_send(io, user_data);
+	}
+
 	return false;
 }
 
@@ -936,10 +980,15 @@ static bool test_io_recv(struct io *io, void *user_data)
 
 	g_assert_cmpint(len, ==, iov->iov_len);
 
+	if (memcmp(buf, iov->iov_base, len))
+		tester_monitor('!', 0x0004, 0x0000, iov->iov_base, len);
+
 	g_assert(memcmp(buf, iov->iov_base, len) == 0);
 
 	if (test->iovcnt)
 		io_set_write_handler(io, test_io_send, NULL, NULL);
+	else if (test->io_complete_func)
+		test->io_complete_func(test->test_data);
 
 	return true;
 }
@@ -1001,6 +1050,13 @@ void tester_io_send(void)
 
 	if (test->iovcnt)
 		io_set_write_handler(ios[1], test_io_send, NULL, NULL);
+}
+
+void tester_io_set_complete_func(tester_data_func_t func)
+{
+	struct test_case *test = tester_get_test();
+
+	test->io_complete_func = func;
 }
 
 int tester_run(void)

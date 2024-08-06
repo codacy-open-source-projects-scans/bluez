@@ -6,6 +6,7 @@
  *  Copyright (C) 2000-2001  Qualcomm Incorporated
  *  Copyright (C) 2002-2003  Maxim Krasnyansky <maxk@qualcomm.com>
  *  Copyright (C) 2002-2010  Marcel Holtmann <marcel@holtmann.org>
+ *  Copyright 2023 NXP
  *
  *
  */
@@ -140,11 +141,20 @@ struct bt_voice {
 #define BT_PKT_STATUS		16
 
 #define BT_SCM_PKT_STATUS	0x03
+#define BT_SCM_ERROR		0x04
 
 #define BT_ISO_QOS		17
 
 #define BT_ISO_QOS_CIG_UNSET	0xff
 #define BT_ISO_QOS_CIS_UNSET	0xff
+
+#define BT_ISO_QOS_BIG_UNSET	0xff
+#define BT_ISO_QOS_BIS_UNSET	0xff
+
+#define BT_ISO_SYNC_TIMEOUT	0x07d0 /* 20 secs */
+
+#define BT_ISO_QOS_GROUP_UNSET	0xff
+#define BT_ISO_QOS_STREAM_UNSET	0xff
 
 struct bt_iso_io_qos {
 	uint32_t interval;
@@ -154,23 +164,46 @@ struct bt_iso_io_qos {
 	uint8_t  rtn;
 };
 
-struct bt_iso_qos {
-	union {
-		uint8_t  cig;
-		uint8_t  big;
-	};
-	union {
-		uint8_t  cis;
-		uint8_t  bis;
-	};
-	union {
-		uint8_t  sca;
-		uint8_t  sync_interval;
-	};
+struct bt_iso_ucast_qos {
+	uint8_t  cig;
+	uint8_t  cis;
+	uint8_t  sca;
 	uint8_t  packing;
 	uint8_t  framing;
 	struct bt_iso_io_qos in;
 	struct bt_iso_io_qos out;
+};
+
+struct bt_iso_bcast_qos {
+	uint8_t  big;
+	uint8_t  bis;
+	uint8_t  sync_factor;
+	uint8_t  packing;
+	uint8_t  framing;
+	struct bt_iso_io_qos in;
+	struct bt_iso_io_qos out;
+	uint8_t  encryption;
+	uint8_t  bcode[16];
+	uint8_t  options;
+	uint16_t skip;
+	uint16_t sync_timeout;
+	uint8_t  sync_cte_type;
+	uint8_t  mse;
+	uint16_t timeout;
+};
+
+/* (HCI_MAX_PER_AD_LENGTH - EIR_SERVICE_DATA_LENGTH) */
+#define BASE_MAX_LENGTH 248
+struct bt_iso_base {
+	uint8_t base_len;
+	uint8_t base[BASE_MAX_LENGTH];
+};
+
+struct bt_iso_qos {
+	union {
+		struct bt_iso_ucast_qos ucast;
+		struct bt_iso_bcast_qos bcast;
+	};
 };
 
 #define BT_CODEC		19
@@ -206,6 +239,8 @@ enum {
 };
 
 #define BT_ISO_BASE		20
+
+#define BT_POLL_ERRQUEUE	21
 
 /* Byte order conversions */
 #if __BYTE_ORDER == __LITTLE_ENDIAN

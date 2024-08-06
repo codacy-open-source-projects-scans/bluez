@@ -503,7 +503,8 @@ static void load_remotes(json_object *jcfg)
 		uint8_t uuid[16];
 		uint16_t unicast, key_idx;
 		const char *str;
-		int ele_cnt, key_cnt;
+		uint8_t ele_cnt;
+		int key_cnt;
 		int j;
 
 		jnode = json_object_array_get_idx(jnodes, i);
@@ -528,13 +529,12 @@ static void load_remotes(json_object *jcfg)
 			continue;
 
 		json_object_object_get_ex(jnode, "elements", &jarray);
-		if (!jarray || json_object_get_type(jarray) != json_type_array)
+		if (!jarray ||
+			json_object_get_type(jarray) != json_type_array ||
+			json_object_array_length(jarray) > MAX_ELE_COUNT)
 			continue;
 
 		ele_cnt = json_object_array_length(jarray);
-
-		if (ele_cnt > MAX_ELE_COUNT)
-			continue;
 
 		json_object_object_get_ex(jnode, "netKeys", &jarray);
 		if (!jarray || json_object_get_type(jarray) != json_type_array)
@@ -1702,6 +1702,29 @@ static json_object *init_elements(uint8_t num_els)
 	return jelements;
 }
 
+bool mesh_db_reset_node(uint16_t original, uint16_t unicast, uint8_t num_els)
+{
+	json_object *jnode, *jelements;
+
+	if (!cfg || !cfg->jcfg)
+		return false;
+
+	jnode = get_node_by_unicast(cfg->jcfg, original);
+	if (!jnode) {
+		l_error("Node %4.4x does not exist", original);
+		return false;
+	}
+
+	if (!write_uint16_hex(jnode, "unicastAddress", unicast))
+		return false;
+
+	json_object_object_del(jnode, "elements");
+	jelements = init_elements(num_els);
+	json_object_object_add(jnode, "elements", jelements);
+
+	return save_config();
+}
+
 bool mesh_db_add_node(uint8_t uuid[16], uint8_t num_els, uint16_t unicast,
 							uint16_t net_idx)
 {
@@ -1864,13 +1887,11 @@ bool mesh_db_node_set_composition(uint16_t unicast, uint8_t *data, uint16_t len)
 	if (!jnode)
 		return false;
 
-	/* skip page -- We only support Page Zero */
-	data++;
-	len--;
+	/* This is for page-0 only */
+	if (*data++ != 0)
+		return false;
 
-	/* If "crpl" property is present, composition is already recorded */
-	if (json_object_object_get_ex(jnode, "crpl", &jobj))
-		return true;
+	len--;
 
 	if (!write_uint16_hex(jnode, "cid", l_get_le16(&data[0])))
 		return false;
@@ -1943,29 +1964,35 @@ bool mesh_db_node_set_composition(uint16_t unicast, uint8_t *data, uint16_t len)
 
 		while (len >= 2 && m--) {
 			mod_id = l_get_le16(data);
+			data += 2;
+			len -= 2;
+
+			jobj = get_model(unicast, unicast + i, mod_id, false);
+			if (jobj)
+				continue;
 
 			jobj = init_model(mod_id);
 			if (!jobj)
 				goto fail;
 
 			json_object_array_add(jmods, jobj);
-			data += 2;
-			len -= 2;
 		}
 
 		while (len >= 4 && v--) {
-			jobj = json_object_new_object();
 			mod_id = l_get_le16(data + 2);
 			mod_id = l_get_le16(data) << 16 | mod_id;
+			data += 4;
+			len -= 4;
+
+			jobj = get_model(unicast, unicast + i, mod_id, true);
+			if (jobj)
+				continue;
 
 			jobj = init_vendor_model(mod_id);
 			if (!jobj)
 				goto fail;
 
 			json_object_array_add(jmods, jobj);
-
-			data += 4;
-			len -= 4;
 		}
 
 		i++;
@@ -1984,7 +2011,8 @@ bool mesh_db_node_set_composition(uint16_t unicast, uint8_t *data, uint16_t len)
 fail:
 	/* Reset elements array */
 	json_object_object_del(jnode, "elements");
-	init_elements(sz);
+	jelements = init_elements(sz);
+	json_object_object_add(jnode, "elements", jelements);
 
 	return false;
 }
