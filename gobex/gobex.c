@@ -304,7 +304,7 @@ static void set_srmp(GObex *obex, guint8 srmp, gboolean outgoing)
 	if (config == NULL)
 		return;
 
-	/* Dont't reset if direction doesn't match */
+	/* Don't reset if direction doesn't match */
 	if (srmp > G_OBEX_SRMP_NEXT_WAIT && config->outgoing != outgoing)
 		return;
 
@@ -316,6 +316,15 @@ static void set_srm(GObex *obex, guint8 op, guint8 srm)
 {
 	struct srm_config *config = obex->srm;
 	gboolean enable;
+
+	switch (srm) {
+	case G_OBEX_SRM_ENABLE:
+	case G_OBEX_SRM_DISABLE:
+	case G_OBEX_SRM_INDICATE:
+		break;
+	default:
+		return;
+	}
 
 	if (config == NULL) {
 		if (srm == G_OBEX_SRM_DISABLE)
@@ -1096,7 +1105,7 @@ static gboolean parse_response(GObex *obex, GObexPacket *rsp)
 		return final;
 
 	/*
-	 * Resposes have final bit set but in case of GET with SRM
+	 * Responses have final bit set but in case of GET with SRM
 	 * we should not remove the request since the remote side will
 	 * continue sending responses until the transfer is finished
 	 */

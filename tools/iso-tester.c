@@ -17,6 +17,7 @@
 #include <errno.h>
 #include <poll.h>
 #include <stdbool.h>
+#include <time.h>
 
 #include <linux/errqueue.h>
 #include <linux/net_tstamp.h>
@@ -476,6 +477,7 @@ struct test_data {
 	bool reconnect;
 	bool suspending;
 	struct tx_tstamp_data tx_ts;
+	int seqnum;
 };
 
 struct iso_client_data {
@@ -494,9 +496,13 @@ struct iso_client_data {
 	uint8_t pkt_status;
 	const uint8_t *base;
 	size_t base_len;
+	uint8_t sid;
 	bool listen_bind;
 	bool pa_bind;
 	bool big;
+
+	/* Enable BT_PKT_SEQNUM for RX packet sequence numbers */
+	bool pkt_seqnum;
 
 	/* Enable SO_TIMESTAMPING with these flags */
 	uint32_t so_timestamping;
@@ -513,12 +519,10 @@ struct iso_client_data {
 	 * Used for testing TX timestamping OPT_ID.
 	 */
 	unsigned int repeat_send;
-
-	/* Disable BT_POLL_ERRQUEUE before enabling TX timestamping */
-	bool no_poll_errqueue;
 };
 
-typedef bool (*iso_defer_accept_t)(struct test_data *data, GIOChannel *io);
+typedef bool (*iso_defer_accept_t)(struct test_data *data, GIOChannel *io,
+						uint8_t num, GIOFunc func);
 
 static void mgmt_debug(const char *str, void *user_data)
 {
@@ -651,18 +655,6 @@ static const uint8_t reset_iso_socket_param[] = {
 	0x00,						/* Action - disable */
 };
 
-static const uint8_t set_poll_errqueue_param[] = {
-	0x33, 0x57, 0x7b, 0xb4, 0x21, 0xc0, 0xc1, 0x8b, /* UUID */
-	0x79, 0x46, 0x9f, 0xb6, 0x4c, 0x8c, 0x51, 0x69,
-	0x01,						/* Action - enable */
-};
-
-static const uint8_t reset_poll_errqueue_param[] = {
-	0x33, 0x57, 0x7b, 0xb4, 0x21, 0xc0, 0xc1, 0x8b, /* UUID */
-	0x79, 0x46, 0x9f, 0xb6, 0x4c, 0x8c, 0x51, 0x69,
-	0x00,						/* Action - disable */
-};
-
 static void set_iso_socket_callback(uint8_t status, uint16_t length,
 					const void *param, void *user_data)
 {
@@ -674,26 +666,9 @@ static void set_iso_socket_callback(uint8_t status, uint16_t length,
 	tester_print("ISO socket feature is enabled");
 }
 
-static void set_poll_errqueue_callback(uint8_t status, uint16_t length,
-					const void *param, void *user_data)
-{
-	if (status != MGMT_STATUS_SUCCESS) {
-		tester_print("Poll Errqueue feature could not be enabled");
-		return;
-	}
-
-	tester_print("Poll Errqueue feature is enabled");
-}
-
 static void test_pre_setup(const void *test_data)
 {
 	struct test_data *data = tester_get_data();
-	const struct iso_client_data *isodata = test_data;
-
-	if (isodata && isodata->so_timestamping) {
-		if (tester_pre_setup_skip_by_default())
-			return;
-	}
 
 	data->mgmt = mgmt_new_default();
 	if (!data->mgmt) {
@@ -709,13 +684,6 @@ static void test_pre_setup(const void *test_data)
 		  sizeof(set_iso_socket_param), set_iso_socket_param,
 		  set_iso_socket_callback, NULL, NULL);
 
-	if (isodata && isodata->no_poll_errqueue) {
-		mgmt_send(data->mgmt, MGMT_OP_SET_EXP_FEATURE, MGMT_INDEX_NONE,
-			  sizeof(set_poll_errqueue_param),
-			  set_poll_errqueue_param,
-			  set_poll_errqueue_callback, NULL, NULL);
-	}
-
 	mgmt_send(data->mgmt, MGMT_OP_READ_INDEX_LIST, MGMT_INDEX_NONE, 0, NULL,
 					read_index_list_callback, NULL, NULL);
 }
@@ -723,18 +691,10 @@ static void test_pre_setup(const void *test_data)
 static void test_post_teardown(const void *test_data)
 {
 	struct test_data *data = tester_get_data();
-	const struct iso_client_data *isodata = test_data;
 
 	mgmt_send(data->mgmt, MGMT_OP_SET_EXP_FEATURE, MGMT_INDEX_NONE,
 		  sizeof(reset_iso_socket_param), reset_iso_socket_param,
 		  NULL, NULL, NULL);
-
-	if (isodata && isodata->no_poll_errqueue) {
-		mgmt_send(data->mgmt, MGMT_OP_SET_EXP_FEATURE, MGMT_INDEX_NONE,
-			  sizeof(reset_poll_errqueue_param),
-			  reset_poll_errqueue_param,
-			  NULL, NULL, NULL);
-	}
 
 	hciemu_unref(data->hciemu);
 	data->hciemu = NULL;
@@ -1053,6 +1013,12 @@ static const struct iovec send_48_2_1 = {
 	.iov_len = sizeof(data_48_2_1),
 };
 
+static const uint8_t data_large[512] = { [0 ... 511] = 0xff };
+static const struct iovec send_large = {
+	.iov_base = (void *)data_large,
+	.iov_len = sizeof(data_large),
+};
+
 static const struct iso_client_data connect_16_2_1_send = {
 	.qos = QOS_16_2_1,
 	.expect_err = 0,
@@ -1065,20 +1031,10 @@ static const struct iso_client_data connect_send_tx_timestamping = {
 	.send = &send_16_2_1,
 	.so_timestamping = (SOF_TIMESTAMPING_SOFTWARE |
 					SOF_TIMESTAMPING_OPT_ID |
-					SOF_TIMESTAMPING_TX_SOFTWARE),
+					SOF_TIMESTAMPING_TX_SOFTWARE |
+					SOF_TIMESTAMPING_TX_COMPLETION),
 	.repeat_send = 1,
 	.repeat_send_pre_ts = 2,
-};
-
-static const struct iso_client_data connect_send_tx_sched_timestamping = {
-	.qos = QOS_16_2_1,
-	.expect_err = 0,
-	.send = &send_16_2_1,
-	.so_timestamping = (SOF_TIMESTAMPING_SOFTWARE |
-					SOF_TIMESTAMPING_TX_SOFTWARE |
-					SOF_TIMESTAMPING_OPT_TSONLY |
-					SOF_TIMESTAMPING_TX_SCHED),
-	.repeat_send = 1,
 };
 
 static const struct iso_client_data connect_send_tx_cmsg_timestamping = {
@@ -1086,25 +1042,23 @@ static const struct iso_client_data connect_send_tx_cmsg_timestamping = {
 	.expect_err = 0,
 	.send = &send_16_2_1,
 	.so_timestamping = (SOF_TIMESTAMPING_SOFTWARE |
-					SOF_TIMESTAMPING_TX_SOFTWARE),
+					SOF_TIMESTAMPING_OPT_TSONLY |
+					SOF_TIMESTAMPING_TX_COMPLETION),
 	.repeat_send = 1,
 	.cmsg_timestamping = true,
-};
-
-static const struct iso_client_data connect_send_tx_no_poll_timestamping = {
-	.qos = QOS_16_2_1,
-	.expect_err = 0,
-	.send = &send_16_2_1,
-	.so_timestamping = (SOF_TIMESTAMPING_SOFTWARE |
-					SOF_TIMESTAMPING_TX_SOFTWARE),
-	.repeat_send = 1,
-	.no_poll_errqueue = true,
 };
 
 static const struct iso_client_data listen_16_2_1_recv = {
 	.qos = QOS_16_2_1,
 	.expect_err = 0,
 	.recv = &send_16_2_1,
+	.server = true,
+};
+
+static const struct iso_client_data listen_16_2_1_recv_frag = {
+	.qos = QOS_16_2_1,
+	.expect_err = 0,
+	.recv = &send_large,
 	.server = true,
 };
 
@@ -1122,6 +1076,43 @@ static const struct iso_client_data listen_16_2_1_recv_pkt_status = {
 	.recv = &send_16_2_1,
 	.server = true,
 	.pkt_status = 0x02,
+};
+
+static const struct iso_client_data listen_16_2_1_recv_pkt_seqnum = {
+	.qos = QOS_16_2_1,
+	.expect_err = 0,
+	.recv = &send_16_2_1,
+	.server = true,
+	.pkt_seqnum = true,
+};
+
+static const struct iso_client_data listen_16_2_1_recv_rx_timestamping = {
+	.qos = QOS_16_2_1,
+	.expect_err = 0,
+	.recv = &send_16_2_1,
+	.server = true,
+	.so_timestamping = (SOF_TIMESTAMPING_SOFTWARE |
+					SOF_TIMESTAMPING_RX_SOFTWARE),
+};
+
+static const struct iso_client_data listen_16_2_1_recv_hw_timestamping = {
+	.qos = QOS_16_2_1,
+	.expect_err = 0,
+	.recv = &send_16_2_1,
+	.server = true,
+	.ts = true,
+	.so_timestamping = (SOF_TIMESTAMPING_RAW_HARDWARE |
+					SOF_TIMESTAMPING_RX_HARDWARE),
+};
+
+static const struct iso_client_data listen_16_2_1_recv_frag_hw_timestamping = {
+	.qos = QOS_16_2_1,
+	.expect_err = 0,
+	.recv = &send_large,
+	.server = true,
+	.ts = true,
+	.so_timestamping = (SOF_TIMESTAMPING_RAW_HARDWARE |
+					SOF_TIMESTAMPING_RX_HARDWARE),
 };
 
 static const struct iso_client_data defer_16_2_1 = {
@@ -1409,6 +1400,35 @@ static const struct iso_client_data bcast_1_1_16_2_1_send = {
 	.base_len = sizeof(base_lc3_16_2_1),
 };
 
+static const struct iso_client_data bcast_16_2_1_send_sid = {
+	.qos = QOS_OUT_16_2_1,
+	.expect_err = 0,
+	.send = &send_16_2_1,
+	.bcast = true,
+	.base = base_lc3_16_2_1,
+	.base_len = sizeof(base_lc3_16_2_1),
+	.sid = 0xff,
+};
+
+static const struct iso_client_data bcast_16_2_1_send_sid1 = {
+	.qos = QOS_OUT_16_2_1,
+	.expect_err = 0,
+	.send = &send_16_2_1,
+	.bcast = true,
+	.base = base_lc3_16_2_1,
+	.base_len = sizeof(base_lc3_16_2_1),
+	.sid = 0x01,
+};
+
+static const struct iso_client_data bcast_16_2_1_reconnect = {
+	.qos = QOS_OUT_16_2_1,
+	.expect_err = 0,
+	.bcast = true,
+	.base = base_lc3_16_2_1,
+	.base_len = sizeof(base_lc3_16_2_1),
+	.disconnect = true,
+};
+
 static const struct iso_client_data bcast_16_2_1_recv = {
 	.qos = QOS_IN_16_2_1,
 	.expect_err = 0,
@@ -1416,6 +1436,34 @@ static const struct iso_client_data bcast_16_2_1_recv = {
 	.bcast = true,
 	.server = true,
 	.big = true,
+};
+
+static const struct iso_client_data bcast_16_2_1_recv2 = {
+	.qos = QOS_IN_16_2_1,
+	.expect_err = 0,
+	.bcast = true,
+	.server = true,
+	.big = true,
+};
+
+static const struct iso_client_data bcast_16_2_1_recv_sid = {
+	.qos = QOS_IN_16_2_1,
+	.expect_err = 0,
+	.recv = &send_16_2_1,
+	.bcast = true,
+	.server = true,
+	.big = true,
+	.sid = 0xff,
+};
+
+static const struct iso_client_data bcast_16_2_1_recv_sid1 = {
+	.qos = QOS_IN_16_2_1,
+	.expect_err = 0,
+	.recv = &send_16_2_1,
+	.bcast = true,
+	.server = true,
+	.big = true,
+	.sid = 0x01,
 };
 
 static const struct iso_client_data bcast_enc_16_2_1_recv = {
@@ -1432,6 +1480,27 @@ static const struct iso_client_data bcast_16_2_1_recv_defer = {
 	.expect_err = 0,
 	.defer = true,
 	.recv = &send_16_2_1,
+	.bcast = true,
+	.server = true,
+	.listen_bind = true,
+	.big = true,
+};
+
+static const struct iso_client_data bcast_16_2_1_recv_defer_reconnect = {
+	.qos = QOS_IN_16_2_1,
+	.expect_err = 0,
+	.defer = true,
+	.bcast = true,
+	.server = true,
+	.pa_bind = true,
+	.big = true,
+	.disconnect = true,
+};
+
+static const struct iso_client_data bcast_16_2_1_recv2_defer = {
+	.qos = QOS_IN_16_2_1,
+	.expect_err = 0,
+	.defer = true,
 	.bcast = true,
 	.server = true,
 	.listen_bind = true,
@@ -1611,12 +1680,17 @@ static void setup_powered_callback(uint8_t status, uint16_t length,
 	for (i = 0; i < data->client_num; i++) {
 		struct hciemu_client *client;
 		struct bthost *host;
+		uint8_t sid = 0;
 
 		client = hciemu_get_client(data->hciemu, i);
 		host = hciemu_client_host(client);
 		bthost_set_cmd_complete_cb(host, client_connectable_complete,
 									data);
-		bthost_set_ext_adv_params(host);
+
+		if (isodata)
+			sid = isodata->sid;
+
+		bthost_set_ext_adv_params(host, sid != 0xff ? sid : 0x00);
 		bthost_set_ext_adv_enable(host, 0x01);
 
 		if (!isodata)
@@ -1794,8 +1868,9 @@ end:
 
 static int create_iso_sock(struct test_data *data)
 {
+	const struct iso_client_data *isodata = data->test_data;
 	const uint8_t *master_bdaddr;
-	struct sockaddr_iso addr;
+	struct sockaddr_iso *addr;
 	int sk, err;
 
 	sk = socket(PF_BLUETOOTH, SOCK_SEQPACKET | SOCK_NONBLOCK, BTPROTO_ISO);
@@ -1813,12 +1888,26 @@ static int create_iso_sock(struct test_data *data)
 		return -ENODEV;
 	}
 
-	memset(&addr, 0, sizeof(addr));
-	addr.iso_family = AF_BLUETOOTH;
-	bacpy(&addr.iso_bdaddr, (void *) master_bdaddr);
-	addr.iso_bdaddr_type = BDADDR_LE_PUBLIC;
+	if (isodata->bcast && isodata->sid) {
+		addr = malloc(sizeof(*addr) + sizeof(*addr->iso_bc));
+		memset(addr, 0, sizeof(*addr) + sizeof(*addr->iso_bc));
+		addr->iso_family = AF_BLUETOOTH;
+		bacpy(&addr->iso_bdaddr, (void *) master_bdaddr);
+		addr->iso_bdaddr_type = BDADDR_LE_PUBLIC;
+		addr->iso_bc->bc_bdaddr_type = BDADDR_LE_PUBLIC;
+		addr->iso_bc->bc_sid = isodata->sid;
+		err = bind(sk, (struct sockaddr *) addr, sizeof(*addr) +
+						sizeof(*addr->iso_bc));
+	} else {
+		addr = malloc(sizeof(*addr));
+		memset(addr, 0, sizeof(*addr));
+		addr->iso_family = AF_BLUETOOTH;
+		bacpy(&addr->iso_bdaddr, (void *) master_bdaddr);
+		addr->iso_bdaddr_type = BDADDR_LE_PUBLIC;
+		err = bind(sk, (struct sockaddr *) addr, sizeof(*addr));
+	}
 
-	if (bind(sk, (struct sockaddr *) &addr, sizeof(addr)) < 0) {
+	if (err < 0) {
 		err = -errno;
 		tester_warn("Can't bind socket: %s (%d)", strerror(errno),
 									errno);
@@ -2115,7 +2204,7 @@ static gboolean iso_recv_data(GIOChannel *io, GIOCondition cond,
 	struct test_data *data = user_data;
 	const struct iso_client_data *isodata = data->test_data;
 	int sk = g_io_channel_unix_get_fd(io);
-	unsigned char control[64];
+	unsigned char control[256];
 	ssize_t ret;
 	char buf[1024];
 	struct msghdr msg;
@@ -2169,8 +2258,53 @@ static gboolean iso_recv_data(GIOChannel *io, GIOCondition cond,
 		return FALSE;
 	}
 
+	if (isodata->pkt_seqnum) {
+		struct cmsghdr *cmsg;
+		uint16_t pkt_seqnum = 0;
+
+		for (cmsg = CMSG_FIRSTHDR(&msg); cmsg != NULL;
+					cmsg = CMSG_NXTHDR(&msg, cmsg)) {
+			if (cmsg->cmsg_level != SOL_BLUETOOTH)
+				continue;
+
+			if (cmsg->cmsg_type == BT_SCM_PKT_SEQNUM) {
+				memcpy(&pkt_seqnum, CMSG_DATA(cmsg),
+						sizeof(pkt_seqnum));
+				tester_debug("BT_SCM_PKT_SEQNUM = 0x%2.2x",
+							pkt_seqnum);
+				break;
+			}
+		}
+
+		if (data->seqnum < 0)
+			data->seqnum = pkt_seqnum;
+		else
+			data->seqnum++;
+
+		if (pkt_seqnum != data->seqnum) {
+			tester_warn("isodata->pkt_seqnum 0x%2.2x != 0x%2.2x "
+					"pkt_seqnum", pkt_seqnum, data->seqnum);
+			tester_test_failed();
+			return FALSE;
+		}
+	}
+
+	if (rx_timestamp_check(&msg, isodata->so_timestamping, 1000) < 0) {
+		tester_test_failed();
+		return FALSE;
+	}
+
+	if (data->step) {
+		data->step--;
+	} else {
+		tester_test_failed();
+		return FALSE;
+	}
+
 	if (memcmp(buf, isodata->recv->iov_base, ret))
 		tester_test_failed();
+	else if (data->step)
+		return TRUE;
 	else
 		tester_test_passed();
 
@@ -2182,6 +2316,7 @@ static void iso_recv(struct test_data *data, GIOChannel *io)
 	const struct iso_client_data *isodata = data->test_data;
 	struct bthost *host;
 	static uint16_t sn;
+	int j, count;
 
 	tester_print("Receive %zu bytes of data", isodata->recv->iov_len);
 
@@ -2191,9 +2326,18 @@ static void iso_recv(struct test_data *data, GIOChannel *io)
 		return;
 	}
 
+	if (rx_timestamping_init(g_io_channel_unix_get_fd(io),
+						isodata->so_timestamping))
+		return;
+
 	host = hciemu_client_get_host(data->hciemu);
-	bthost_send_iso(host, data->handle, isodata->ts, sn++, 0,
-				isodata->pkt_status, isodata->recv, 1);
+
+	count = isodata->pkt_seqnum ? 2 : 1;
+	for (j = 0; j < count; ++j) {
+		bthost_send_iso(host, data->handle, isodata->ts, sn++, j + 1,
+					isodata->pkt_status, isodata->recv, 1);
+		data->step++;
+	}
 
 	data->io_id[0] = g_io_add_watch(io, G_IO_IN, iso_recv_data, data);
 }
@@ -2211,44 +2355,13 @@ static gboolean iso_recv_errqueue(GIOChannel *io, GIOCondition cond,
 	err = tx_tstamp_recv(&data->tx_ts, sk, isodata->send->iov_len);
 	if (err > 0)
 		return TRUE;
-	else if (!err && !data->step)
-		tester_test_passed();
-	else
+	else if (err)
 		tester_test_failed();
+	else if (!data->step)
+		tester_test_passed();
 
 	data->io_id[2] = 0;
 	return FALSE;
-}
-
-static gboolean iso_fail_errqueue(GIOChannel *io, GIOCondition cond,
-							gpointer user_data)
-{
-	struct test_data *data = user_data;
-
-	tester_warn("Unexpected POLLERR");
-	tester_test_failed();
-
-	data->io_id[3] = 0;
-	return FALSE;
-}
-
-static gboolean iso_timer_errqueue(gpointer user_data)
-{
-	struct test_data *data = user_data;
-	GIOChannel *io;
-	gboolean ret;
-
-	io = queue_peek_head(data->io_queue);
-	g_assert(io);
-
-	ret = iso_recv_errqueue(io, G_IO_IN, data);
-	if (!ret) {
-		if (data->io_id[3])
-			g_source_remove(data->io_id[3]);
-		data->io_id[3] = 0;
-	}
-
-	return ret;
 }
 
 static void iso_tx_timestamping(struct test_data *data, GIOChannel *io)
@@ -2259,54 +2372,22 @@ static void iso_tx_timestamping(struct test_data *data, GIOChannel *io)
 	int err;
 	unsigned int count;
 
-	if (!(isodata->so_timestamping & SOF_TIMESTAMPING_TX_RECORD_MASK))
+	if (!(isodata->so_timestamping & TS_TX_RECORD_MASK))
 		return;
 
 	tester_print("Enabling TX timestamping");
 
-	tx_tstamp_init(&data->tx_ts, isodata->so_timestamping);
+	tx_tstamp_init(&data->tx_ts, isodata->so_timestamping, false);
 
 	for (count = 0; count < isodata->repeat_send + 1; ++count)
-		data->step += tx_tstamp_expect(&data->tx_ts);
+		data->step += tx_tstamp_expect(&data->tx_ts, 0);
 
 	sk = g_io_channel_unix_get_fd(io);
 
-	if (isodata->no_poll_errqueue) {
-		uint32_t flag = 0;
-
-		err = setsockopt(sk, SOL_BLUETOOTH, BT_POLL_ERRQUEUE,
-							&flag, sizeof(flag));
-		if (err < 0) {
-			tester_warn("setsockopt BT_POLL_ERRQUEUE: %s (%d)",
-						strerror(errno), errno);
-			tester_test_failed();
-			return;
-		}
-
-		if (!data->io_queue)
-			data->io_queue = queue_new();
-		queue_push_head(data->io_queue, g_io_channel_ref(io));
-
-		data->io_id[2] = g_timeout_add(100, iso_timer_errqueue, data);
-		data->io_id[3] = g_io_add_watch(io, G_IO_ERR, iso_fail_errqueue,
-									data);
-	} else {
-		uint32_t flag = 1;
-
-		err = setsockopt(sk, SOL_BLUETOOTH, BT_POLL_ERRQUEUE,
-							&flag, sizeof(flag));
-		if (err >= 0) {
-			tester_warn("BT_POLL_ERRQUEUE available");
-			tester_test_failed();
-			return;
-		}
-
-		data->io_id[2] = g_io_add_watch(io, G_IO_ERR, iso_recv_errqueue,
-									data);
-	}
+	data->io_id[2] = g_io_add_watch(io, G_IO_ERR, iso_recv_errqueue, data);
 
 	if (isodata->cmsg_timestamping)
-		so &= ~SOF_TIMESTAMPING_TX_RECORD_MASK;
+		so &= ~TS_TX_RECORD_MASK;
 
 	err = setsockopt(sk, SOL_SOCKET, SO_TIMESTAMPING, &so, sizeof(so));
 	if (err < 0) {
@@ -2344,7 +2425,7 @@ static void iso_send_data(struct test_data *data, GIOChannel *io)
 		cmsg->cmsg_len = CMSG_LEN(sizeof(uint32_t));
 
 		*((uint32_t *)CMSG_DATA(cmsg)) = (isodata->so_timestamping &
-					SOF_TIMESTAMPING_TX_RECORD_MASK);
+					TS_TX_RECORD_MASK);
 	}
 
 	ret = sendmsg(sk, &msg, 0);
@@ -2385,6 +2466,8 @@ static gboolean iso_connect_cb(GIOChannel *io, GIOCondition cond,
 							gpointer user_data);
 static gboolean iso_accept_cb(GIOChannel *io, GIOCondition cond,
 							gpointer user_data);
+static bool iso_defer_accept_bcast(struct test_data *data, GIOChannel *io,
+						uint8_t num, GIOFunc func);
 
 static gboolean iso_disconnected(GIOChannel *io, GIOCondition cond,
 							gpointer user_data)
@@ -2402,7 +2485,19 @@ static gboolean iso_disconnected(GIOChannel *io, GIOCondition cond,
 
 		if (data->reconnect) {
 			data->reconnect = false;
-			test_connect(data->test_data);
+
+			if (!isodata->server)
+				test_connect(data->test_data);
+			else {
+				GIOChannel *parent =
+					queue_peek_head(data->io_queue);
+
+				data->step++;
+
+				iso_defer_accept_bcast(data,
+					parent, 0, iso_accept_cb);
+			}
+
 			return FALSE;
 		}
 
@@ -2526,6 +2621,42 @@ static gboolean iso_connect(GIOChannel *io, GIOCondition cond,
 			tester_test_failed();
 			return FALSE;
 		}
+	}
+
+	if (isodata->sid == 0xff) {
+		struct {
+			struct sockaddr_iso iso;
+			struct sockaddr_iso_bc bc;
+		} addr;
+		socklen_t olen;
+
+		olen = sizeof(addr);
+
+		memset(&addr, 0, olen);
+		if (getpeername(sk, (void *)&addr, &olen) < 0) {
+			tester_warn("getpeername: %s (%d)",
+					strerror(errno), errno);
+			data->step = 0;
+			tester_test_failed();
+			return FALSE;
+		}
+
+		if (olen != sizeof(addr)) {
+			tester_warn("getpeername: olen %d != %zu sizeof(addr)",
+					olen, sizeof(addr));
+			data->step = 0;
+			tester_test_failed();
+			return FALSE;
+		}
+
+		if (addr.bc.bc_sid > 0x0f) {
+			tester_warn("Invalid SID: %d", addr.bc.bc_sid);
+			data->step = 0;
+			tester_test_failed();
+			return FALSE;
+		}
+
+		tester_print("SID: 0x%02x", addr.bc.bc_sid);
 	}
 
 	len = sizeof(sk_err);
@@ -2763,7 +2894,7 @@ static void test_defer(const void *test_data)
 		tester_test_failed();
 }
 
-static int listen_iso_sock(struct test_data *data)
+static int listen_iso_sock(struct test_data *data, uint8_t num)
 {
 	const struct iso_client_data *isodata = data->test_data;
 	const uint8_t *src, *dst;
@@ -2793,8 +2924,12 @@ static int listen_iso_sock(struct test_data *data)
 	addr->iso_bdaddr_type = BDADDR_LE_PUBLIC;
 
 	if (isodata->bcast) {
+		struct hciemu_client *client;
+
+		client = hciemu_get_client(data->hciemu, num);
+
 		/* Bind to destination address in case of broadcast */
-		dst = hciemu_get_client_bdaddr(data->hciemu);
+		dst = hciemu_client_bdaddr(client);
 		if (!dst) {
 			tester_warn("No source bdaddr");
 			err = -ENODEV;
@@ -2803,6 +2938,7 @@ static int listen_iso_sock(struct test_data *data)
 
 		bacpy(&addr->iso_bc->bc_bdaddr, (void *) dst);
 		addr->iso_bc->bc_bdaddr_type = BDADDR_LE_PUBLIC;
+		addr->iso_bc->bc_sid = isodata->sid;
 
 		if (!isodata->defer || isodata->listen_bind) {
 			addr->iso_bc->bc_num_bis = 1;
@@ -2857,31 +2993,36 @@ fail:
 	return err;
 }
 
-static void setup_listen(struct test_data *data, uint8_t num, GIOFunc func)
+static void setup_listen_many(struct test_data *data, uint8_t n, uint8_t *num,
+								GIOFunc *func)
 {
 	const struct iso_client_data *isodata = data->test_data;
+	int sk[256];
 	GIOChannel *io;
-	int sk;
+	unsigned int i;
 
-	sk = listen_iso_sock(data);
-	if (sk < 0) {
-		if (sk == -EPROTONOSUPPORT)
-			tester_test_abort();
-		else
-			tester_test_failed();
-		return;
+	for (i = 0; i < n; ++i) {
+		sk[i] = listen_iso_sock(data, num[i]);
+		if (sk[i] < 0) {
+			if (sk[i] == -EPROTONOSUPPORT)
+				tester_test_abort();
+			else
+				tester_test_failed();
+			return;
+		}
+
+		io = g_io_channel_unix_new(sk[i]);
+		g_io_channel_set_close_on_unref(io, TRUE);
+
+		data->io_id[num[i]] = g_io_add_watch(io, G_IO_IN,
+							func[i], NULL);
+
+		g_io_channel_unref(io);
+
+		tester_print("Listen %d in progress", num[i]);
+
+		data->step++;
 	}
-
-	io = g_io_channel_unix_new(sk);
-	g_io_channel_set_close_on_unref(io, TRUE);
-
-	data->io_id[num] = g_io_add_watch(io, G_IO_IN, func, NULL);
-
-	g_io_channel_unref(io);
-
-	tester_print("Listen in progress");
-
-	data->step++;
 
 	if (!isodata->bcast) {
 		struct hciemu_client *client;
@@ -2901,7 +3042,13 @@ static void setup_listen(struct test_data *data, uint8_t num, GIOFunc func)
 	}
 }
 
-static bool iso_defer_accept_bcast(struct test_data *data, GIOChannel *io)
+static void setup_listen(struct test_data *data, uint8_t num, GIOFunc func)
+{
+	return setup_listen_many(data, 1, &num, &func);
+}
+
+static bool iso_defer_accept_bcast(struct test_data *data, GIOChannel *io,
+						uint8_t num, GIOFunc func)
 {
 	int sk;
 	char c;
@@ -2935,17 +3082,20 @@ static bool iso_defer_accept_bcast(struct test_data *data, GIOChannel *io)
 
 	tester_print("Accept deferred setup");
 
-	data->io_queue = queue_new();
+	if (!data->io_queue)
+		data->io_queue = queue_new();
+
 	if (data->io_queue)
 		queue_push_tail(data->io_queue, io);
 
-	data->io_id[0] = g_io_add_watch(io, G_IO_IN,
-				iso_accept_cb, NULL);
+	data->io_id[num] = g_io_add_watch(io, G_IO_IN,
+				func, NULL);
 
 	return true;
 }
 
-static bool iso_defer_accept_ucast(struct test_data *data, GIOChannel *io)
+static bool iso_defer_accept_ucast(struct test_data *data, GIOChannel *io,
+						uint8_t num, GIOFunc func)
 {
 	int sk;
 	char c;
@@ -2975,23 +3125,23 @@ static bool iso_defer_accept_ucast(struct test_data *data, GIOChannel *io)
 	if (data->io_queue)
 		queue_push_tail(data->io_queue, io);
 
-	data->io_id[0] = g_io_add_watch(io, G_IO_OUT,
-				iso_connect_cb, NULL);
+	data->io_id[num] = g_io_add_watch(io, G_IO_OUT,
+				func, NULL);
 
 	return true;
 }
 
-static gboolean iso_accept_cb(GIOChannel *io, GIOCondition cond,
-							gpointer user_data)
+static gboolean iso_accept(GIOChannel *io, GIOCondition cond,
+				gpointer user_data, uint8_t num, GIOFunc func)
 {
 	struct test_data *data = tester_get_data();
 	const struct iso_client_data *isodata = data->test_data;
 	int sk, new_sk;
-	iso_defer_accept_t iso_accept = isodata->bcast ?
+	gboolean ret;
+	GIOChannel *new_io;
+	iso_defer_accept_t iso_defer_accept = isodata->bcast ?
 						iso_defer_accept_bcast :
 						iso_defer_accept_ucast;
-
-	data->io_id[0] = 0;
 
 	sk = g_io_channel_unix_get_fd(io);
 
@@ -3001,24 +3151,32 @@ static gboolean iso_accept_cb(GIOChannel *io, GIOCondition cond,
 		return false;
 	}
 
-	io = g_io_channel_unix_new(new_sk);
-	g_io_channel_set_close_on_unref(io, TRUE);
+	new_io = g_io_channel_unix_new(new_sk);
+	g_io_channel_set_close_on_unref(new_io, TRUE);
 
 	if (isodata->defer) {
 		if (isodata->expect_err < 0) {
-			g_io_channel_unref(io);
+			g_io_channel_unref(new_io);
 			tester_test_passed();
 			return false;
 		}
 
 		if (isodata->bcast) {
-			iso_connect(io, cond, user_data);
+			iso_connect(new_io, cond, user_data);
 
-			if (!data->step)
+			if (!data->step) {
+				g_io_channel_unref(new_io);
 				return false;
+			}
+
+			/* Return if connection has already been accepted */
+			if (queue_find(data->io_queue, NULL, io)) {
+				g_io_channel_unref(new_io);
+				return false;
+			}
 		}
 
-		if (!iso_accept(data, io)) {
+		if (!iso_defer_accept(data, new_io, num, func)) {
 			tester_warn("Unable to accept deferred setup");
 			tester_test_failed();
 		}
@@ -3037,7 +3195,48 @@ static gboolean iso_accept_cb(GIOChannel *io, GIOCondition cond,
 		}
 	}
 
-	return iso_connect(io, cond, user_data);
+	if (isodata->pkt_seqnum) {
+		int opt = 1;
+
+		data->seqnum = -1;
+
+		if (setsockopt(new_sk, SOL_BLUETOOTH, BT_PKT_SEQNUM, &opt,
+							sizeof(opt)) < 0) {
+			tester_print("Can't set socket BT_PKT_SEQNUM option: "
+					"%s (%d)", strerror(errno), errno);
+			tester_test_failed();
+			return false;
+		}
+	}
+
+	ret = iso_connect(new_io, cond, user_data);
+
+	g_io_channel_unref(new_io);
+	return ret;
+}
+
+static gboolean iso_accept_cb(GIOChannel *io, GIOCondition cond,
+							gpointer user_data)
+{
+	struct test_data *data = tester_get_data();
+	const struct iso_client_data *isodata = data->test_data;
+
+	data->io_id[0] = 0;
+
+	if (isodata->bcast)
+		return iso_accept(io, cond, user_data, 0, iso_accept_cb);
+	else
+		return iso_accept(io, cond, user_data, 0, iso_connect_cb);
+}
+
+static gboolean iso_accept2_cb(GIOChannel *io, GIOCondition cond,
+							gpointer user_data)
+{
+	struct test_data *data = tester_get_data();
+
+	data->io_id[1] = 0;
+
+	return iso_accept(io, cond, user_data, 1, iso_accept2_cb);
 }
 
 static void test_listen(const void *test_data)
@@ -3287,6 +3486,14 @@ static void test_bcast(const void *test_data)
 	setup_connect(data, 0, iso_connect_cb);
 }
 
+static void test_bcast_reconnect(const void *test_data)
+{
+	struct test_data *data = tester_get_data();
+
+	data->reconnect = true;
+	setup_connect(data, 0, iso_connect_cb);
+}
+
 static void test_bcast2(const void *test_data)
 {
 	struct test_data *data = tester_get_data();
@@ -3315,6 +3522,15 @@ static void test_bcast_recv(const void *test_data)
 	setup_listen(data, 0, iso_accept_cb);
 }
 
+static void test_bcast_recv2(const void *test_data)
+{
+	struct test_data *data = tester_get_data();
+	uint8_t num[2] = {0, 1};
+	GIOFunc funcs[2] = {iso_accept_cb, iso_accept2_cb};
+
+	setup_listen_many(data, 2, num, funcs);
+}
+
 static void test_bcast_recv_defer(const void *test_data)
 {
 	struct test_data *data = tester_get_data();
@@ -3324,10 +3540,38 @@ static void test_bcast_recv_defer(const void *test_data)
 	setup_listen(data, 0, iso_accept_cb);
 }
 
+static void test_bcast_recv_defer_reconnect(const void *test_data)
+{
+	struct test_data *data = tester_get_data();
+
+	data->reconnect = true;
+	data->step = 1;
+
+	setup_listen(data, 0, iso_accept_cb);
+}
+
+static void test_bcast_recv2_defer(const void *test_data)
+{
+	struct test_data *data = tester_get_data();
+	uint8_t num[2] = {0, 1};
+	GIOFunc funcs[2] = {iso_accept_cb, iso_accept2_cb};
+
+	data->step = 2;
+
+	setup_listen_many(data, 2, num, funcs);
+}
+
 static void test_connect2_suspend(const void *test_data)
 {
 	test_connect2(test_data);
 	trigger_force_suspend((void *)test_data);
+}
+
+static void test_iso_ethtool_get_ts_info(const void *test_data)
+{
+	struct test_data *data = tester_get_data();
+
+	test_ethtool_get_ts_info(data->mgmt_index, BTPROTO_ISO, false);
 }
 
 int main(int argc, char *argv[])
@@ -3518,22 +3762,16 @@ int main(int argc, char *argv[])
 	test_iso("ISO Send - TX Timestamping", &connect_send_tx_timestamping,
 						setup_powered, test_connect);
 
-	/* Test schedule-time TX timestamps are emitted */
-	test_iso("ISO Send - TX Sched Timestamping",
-			&connect_send_tx_sched_timestamping, setup_powered,
-			test_connect);
-
 	/* Test TX timestamping with flags set via per-packet CMSG */
 	test_iso("ISO Send - TX CMSG Timestamping",
 			&connect_send_tx_cmsg_timestamping, setup_powered,
 			test_connect);
 
-	/* Test TX timestamping and disabling POLLERR wakeup */
-	test_iso("ISO Send - TX No Poll Timestamping",
-			&connect_send_tx_no_poll_timestamping, setup_powered,
-			test_connect);
-
 	test_iso("ISO Receive - Success", &listen_16_2_1_recv, setup_powered,
+							test_listen);
+
+	test_iso("ISO Receive Fragmented - Success", &listen_16_2_1_recv_frag,
+							setup_powered,
 							test_listen);
 
 	test_iso("ISO Receive Timestamped - Success", &listen_16_2_1_recv_ts,
@@ -3543,6 +3781,22 @@ int main(int argc, char *argv[])
 	test_iso("ISO Receive Packet Status - Success",
 						&listen_16_2_1_recv_pkt_status,
 						setup_powered, test_listen);
+
+	test_iso("ISO Receive Packet Seqnum - Success",
+						&listen_16_2_1_recv_pkt_seqnum,
+						setup_powered, test_listen);
+
+	test_iso("ISO Receive - RX Timestamping",
+					&listen_16_2_1_recv_rx_timestamping,
+					setup_powered, test_listen);
+
+	test_iso("ISO Receive - HW Timestamping",
+					&listen_16_2_1_recv_hw_timestamping,
+					setup_powered, test_listen);
+
+	test_iso("ISO Receive Fragmented - HW Timestamping",
+				&listen_16_2_1_recv_frag_hw_timestamping,
+				setup_powered, test_listen);
 
 	test_iso("ISO Defer - Success", &defer_16_2_1, setup_powered,
 							test_defer);
@@ -3699,10 +3953,31 @@ int main(int argc, char *argv[])
 							&bcast_1_1_16_2_1_send,
 							setup_powered,
 							test_bcast);
+	test_iso("ISO Broadcaster SID auto - Success", &bcast_16_2_1_send_sid,
+							setup_powered,
+							test_bcast);
+	test_iso("ISO Broadcaster SID 0x01 - Success", &bcast_16_2_1_send_sid1,
+							setup_powered,
+							test_bcast);
+	test_iso("ISO Broadcaster Reconnect - Success", &bcast_16_2_1_reconnect,
+							setup_powered,
+							test_bcast_reconnect);
 
 	test_iso("ISO Broadcaster Receiver - Success", &bcast_16_2_1_recv,
 							setup_powered,
 							test_bcast_recv);
+	test_iso("ISO Broadcaster Receiver SID auto - Success",
+							&bcast_16_2_1_recv_sid,
+							setup_powered,
+							test_bcast_recv);
+	test_iso("ISO Broadcaster Receiver SID 0x01 - Success",
+							&bcast_16_2_1_recv_sid1,
+							setup_powered,
+							test_bcast_recv);
+	test_iso2("ISO Broadcaster Receiver2 - Success", &bcast_16_2_1_recv2,
+							setup_powered,
+							test_bcast_recv2);
+
 	test_iso("ISO Broadcaster Receiver Encrypted - Success",
 							&bcast_enc_16_2_1_recv,
 							setup_powered,
@@ -3711,6 +3986,15 @@ int main(int argc, char *argv[])
 						&bcast_16_2_1_recv_defer,
 						setup_powered,
 						test_bcast_recv_defer);
+	test_iso("ISO Broadcaster Receiver Defer Reconnect - Success",
+					&bcast_16_2_1_recv_defer_reconnect,
+					setup_powered,
+					test_bcast_recv_defer_reconnect);
+	test_iso2("ISO Broadcaster Receiver2 Defer - Success",
+						&bcast_16_2_1_recv2_defer,
+						setup_powered,
+						test_bcast_recv2_defer);
+
 	test_iso("ISO Broadcaster Receiver Defer No BIS - Success",
 						&bcast_16_2_1_recv_defer_no_bis,
 						setup_powered,
@@ -3741,6 +4025,9 @@ int main(int argc, char *argv[])
 
 	test_iso("ISO Broadcaster AC 14 - Success", &bcast_ac_14, setup_powered,
 							test_bcast);
+
+	test_iso("ISO Ethtool Get Ts Info - Success", NULL, setup_powered,
+						test_iso_ethtool_get_ts_info);
 
 	return tester_run();
 }

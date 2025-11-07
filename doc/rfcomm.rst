@@ -7,7 +7,7 @@ RFCOMM protocol
 ---------------
 
 :Version: BlueZ
-:Copyright: Free use of this software is granted under ther terms of the GNU
+:Copyright: Free use of this software is granted under the terms of the GNU
             Lesser General Public Licenses (LGPL).
 :Date: May 2024
 :Manual section: 7
@@ -16,7 +16,7 @@ RFCOMM protocol
 SYNOPSIS
 ========
 
-.. code-block:: c
+.. code-block::
 
     #include <sys/socket.h>
     #include <bluetooth/bluetooth.h>
@@ -36,7 +36,7 @@ the 9 circuits of RS-232 (EIATIA-232-E) serial ports.
 SOCKET ADDRESS
 ==============
 
-.. code-block:: c
+.. code-block::
 
     struct sockaddr_rc {
         sa_family_t rc_family;
@@ -46,7 +46,7 @@ SOCKET ADDRESS
 
 Example:
 
-.. code-block:: c
+.. code-block::
 
     struct sockaddr_rc addr;
 
@@ -78,7 +78,7 @@ Channel security level, possible values:
 
 Example:
 
-.. code-block:: c
+.. code-block::
 
     int level = BT_SECURITY_HIGH;
     int err = setsockopt(rfcomm_socket, SOL_BLUETOOTH, BT_SECURITY, &level,
@@ -104,7 +104,7 @@ authorization at profile level, possible values:
 
 Example:
 
-.. code-block:: c
+.. code-block::
 
     int defer_setup = 1;
     int err = setsockopt(rfcomm_socket, SOL_BLUETOOTH, BT_DEFER_SETUP,
@@ -163,19 +163,6 @@ not, possible values:
 
     **BT_FLUSHABLE_OFF**, 0x00 (default), Do not flush data
     **BT_FLUSHABLE_ON**, 0x01, Flush data
-
-BT_POWER (since Linux 3.1)
---------------------------
-
-Channel power policy, this control if the channel shall force exit of sniff
-mode or not, possible values:
-
-.. csv-table::
-    :header: "Define", "Value", "Description"
-    :widths: auto
-
-    **BT_POWER_FORCE_ACTIVE_OFF**, 0x00 (default), Don't force exit of sniff mode
-    **BT_POWER_FORCE_ACTIVE_ON**, 0x01, Force exit of sniff mode
 
 BT_CHANNEL_POLICY (since Linux 3.10)
 ------------------------------------

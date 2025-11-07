@@ -30,6 +30,7 @@ struct queue;
 struct btd_adapter *btd_adapter_get_default(void);
 bool btd_adapter_is_default(struct btd_adapter *adapter);
 uint16_t btd_adapter_get_index(struct btd_adapter *adapter);
+bool btd_adapter_has_cable_pairing_devices(struct btd_adapter *adapter);
 
 typedef void (*adapter_cb) (struct btd_adapter *adapter, gpointer user_data);
 
@@ -298,3 +299,5 @@ void btd_adapter_store_conn_param(struct btd_adapter *adapter,
 				const bdaddr_t *peer, uint8_t bdaddr_type,
 				uint16_t min_interval, uint16_t max_interval,
 				uint16_t latency, uint16_t timeout);
+void btd_adapter_cancel_service_auth(struct btd_adapter *adapter,
+				struct btd_device *device);

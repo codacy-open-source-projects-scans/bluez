@@ -40,7 +40,7 @@
 #define AGENT_INTERFACE OBEXD_SERVICE ".Agent1"
 #define OBEX_ERROR_REJECT      "org.bluez.obex.Error.Rejected"
 
-#define TIMEOUT 60*1000 /* Timeout for user response (miliseconds) */
+#define TIMEOUT 60*1000 /* Timeout for user response (milliseconds) */
 
 struct agent {
 	char *bus_name;
@@ -488,7 +488,7 @@ gboolean manager_init(void)
 
 	dbus_error_init(&err);
 
-	connection = g_dbus_setup_bus(DBUS_BUS_SESSION, OBEXD_SERVICE, &err);
+	connection = obex_setup_dbus_connection(OBEXD_SERVICE, &err);
 	if (connection == NULL) {
 		if (dbus_error_is_set(&err) == TRUE) {
 			fprintf(stderr, "%s\n", err.message);

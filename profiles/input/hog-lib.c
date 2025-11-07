@@ -830,14 +830,16 @@ static void uhid_destroy(struct bt_hog *hog, bool force)
 {
 	int err;
 
+	if (!hog->uhid)
+		return;
+
+	bt_uhid_unregister_all(hog->uhid);
+
 	err = bt_uhid_destroy(hog->uhid, force);
 	if (err < 0) {
 		error("bt_uhid_destroy: %s", strerror(-err));
 		return;
 	}
-
-	if (bt_uhid_created(hog->uhid))
-		bt_uhid_unregister_all(hog->uhid);
 }
 
 static void set_report(struct uhid_event *ev, void *user_data)
@@ -1130,7 +1132,7 @@ static void proto_mode_read_cb(guint8 status, const guint8 *pdu, guint16 plen,
 	if (value == HOG_PROTO_MODE_BOOT) {
 		uint8_t nval = HOG_PROTO_MODE_REPORT;
 
-		DBG("HoG is operating in Boot Procotol Mode");
+		DBG("HoG is operating in Boot Protocol Mode");
 
 		gatt_write_cmd(hog->attrib, hog->proto_mode_handle, &nval,
 						sizeof(nval), NULL, NULL);
@@ -1419,7 +1421,18 @@ static struct bt_hog *hog_new(int fd, const char *name, uint16_t vendor,
 					uint8_t type,
 					struct gatt_db_attribute *attr)
 {
+	struct bt_uhid *uhid;
 	struct bt_hog *hog;
+
+	if (fd < 0)
+		uhid = bt_uhid_new_default();
+	else
+		uhid = bt_uhid_new(fd);
+
+	if (!uhid) {
+		DBG("Unable to create UHID");
+		return NULL;
+	}
 
 	hog = g_try_new0(struct bt_hog, 1);
 	if (!hog)
@@ -1427,15 +1440,10 @@ static struct bt_hog *hog_new(int fd, const char *name, uint16_t vendor,
 
 	hog->gatt_op = queue_new();
 	hog->bas = queue_new();
-
-	if (fd < 0)
-		hog->uhid = bt_uhid_new_default();
-	else
-		hog->uhid = bt_uhid_new(fd);
-
 	hog->uhid_fd = fd;
+	hog->uhid = uhid;
 
-	if (!hog->gatt_op || !hog->bas || !hog->uhid) {
+	if (!hog->gatt_op || !hog->bas) {
 		hog_free(hog);
 		return NULL;
 	}

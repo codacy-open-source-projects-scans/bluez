@@ -36,6 +36,9 @@ void bthost_debug(struct bthost *bthost, const char *format, ...)
 void bthost_set_send_handler(struct bthost *bthost, bthost_send_func handler,
 							void *user_data);
 
+void bthost_set_acl_mtu(struct bthost *bthost, uint16_t mtu);
+void bthost_set_iso_mtu(struct bthost *bthost, uint16_t mtu);
+
 void bthost_receive_h4(struct bthost *bthost, const void *data, uint16_t len);
 
 typedef void (*bthost_cmd_complete_cb) (uint16_t opcode, uint8_t status,
@@ -49,6 +52,9 @@ typedef uint8_t (*bthost_accept_conn_cb) (uint16_t handle, void *user_data);
 typedef void (*bthost_new_conn_cb) (uint16_t handle, void *user_data);
 
 void bthost_set_connect_cb(struct bthost *bthost, bthost_new_conn_cb cb,
+							void *user_data);
+
+void bthost_set_sco_cb(struct bthost *bthost, bthost_new_conn_cb cb,
 							void *user_data);
 
 void bthost_set_iso_cb(struct bthost *bthost, bthost_accept_conn_cb accept,
@@ -69,6 +75,13 @@ typedef void (*bthost_cid_hook_func_t)(const void *data, uint16_t len,
 void bthost_add_cid_hook(struct bthost *bthost, uint16_t handle, uint16_t cid,
 				bthost_cid_hook_func_t func, void *user_data);
 
+typedef void (*bthost_sco_hook_func_t)(const void *data, uint16_t len,
+					uint8_t status, void *user_data);
+
+void bthost_add_sco_hook(struct bthost *bthost, uint16_t handle,
+				bthost_sco_hook_func_t func, void *user_data,
+				bthost_destroy_func_t destroy);
+
 typedef void (*bthost_iso_hook_func_t)(const void *data, uint16_t len,
 							void *user_data);
 
@@ -80,6 +93,8 @@ void bthost_send_cid(struct bthost *bthost, uint16_t handle, uint16_t cid,
 					const void *data, uint16_t len);
 void bthost_send_cid_v(struct bthost *bthost, uint16_t handle, uint16_t cid,
 					const struct iovec *iov, int iovcnt);
+void bthost_send_sco(struct bthost *bthost, uint16_t handle, uint8_t pkt_status,
+			const struct iovec *iov, int iovcnt);
 void bthost_send_iso(struct bthost *bthost, uint16_t handle, bool ts,
 			uint16_t sn, uint32_t timestamp, uint8_t pkt_status,
 			const struct iovec *iov, int iovcnt);
@@ -99,7 +114,7 @@ void bthost_set_adv_enable(struct bthost *bthost, uint8_t enable);
 
 void bthost_set_ext_adv_data(struct bthost *bthost, const uint8_t *data,
 								uint8_t len);
-void bthost_set_ext_adv_params(struct bthost *bthost);
+void bthost_set_ext_adv_params(struct bthost *bthost, uint8_t sid);
 void bthost_set_ext_adv_enable(struct bthost *bthost, uint8_t enable);
 void bthost_set_pa_params(struct bthost *bthost);
 void bthost_set_pa_data(struct bthost *bthost, const uint8_t *data,

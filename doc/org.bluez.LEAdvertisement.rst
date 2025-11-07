@@ -19,7 +19,7 @@ channels and available for all devices in range.  Because of the limited space
 available in LE Advertising packets, each packet's contents must be carefully
 controlled.
 
-The service daemon acts as a store for the Advertisement Data which is meant to
+**bluetoothd(8)** acts as a store for the Advertisement Data which is meant to
 be sent. It constructs the correct Advertisement Data from the structured
 data and configured the kernel to send the correct advertisement.
 
@@ -42,10 +42,11 @@ Methods
 void Release() [noreply]
 ````````````````````````
 
-	This method gets called when the service daemon removes the
-	Advertisement. A client can use it to do cleanup tasks. There is no
-	need to call **UnregisterAdvertisement()** because when this method
-	gets called it has already been unregistered.
+This method gets called when the **bluetoothd(8)** removes the Advertisement.
+
+A client can use it to do cleanup tasks. There is no need to call
+**UnregisterAdvertisement()** because when this method gets called it has
+already been unregistered.
 
 Properties
 ----------
@@ -53,143 +54,183 @@ Properties
 string Type [readonly]
 ``````````````````````
 
-	Determines the type of advertising packet requested.
+Determines the type of advertising packet requested.
 
-	Possible values:
+Possible values:
 
-	:"broadcast":
-	:"peripheral":
+:"broadcast":
+:"peripheral":
 
-array{string} ServiceUUIDs
-``````````````````````````
+array{string} ServiceUUIDs [readonly, optional]
+```````````````````````````````````````````````
 
-	List of UUIDs to include in the "Service UUID" field of the Advertising
-	Data.
+List of UUIDs to include in the "Service UUID" field of the Advertising Data.
 
-dict ManufacturerData
-`````````````````````
+dict ManufacturerData [readonly, optional]
+``````````````````````````````````````````
 
-	Manufacturer Data fields to include in the Advertising Data.  Keys are
-	the Manufacturer ID to associate with the data.
+Manufacturer Data fields to include in the Advertising Data.
 
-array{string} SolicitUUIDs
-``````````````````````````
+Keys are the Manufacturer ID to associate with the data.
 
-	Array of UUIDs to include in "Service Solicitation" Advertisement Data.
+array{string} SolicitUUIDs [readonly, optional]
+```````````````````````````````````````````````
 
-dict ServiceData
-````````````````
+List of UUIDs to include in the "Service Solicitation" field of the Advertising
+Data.
 
-	Service Data elements to include. The keys are the UUID to associate
-	with the data.
+dict ServiceData [readonly, optional]
+`````````````````````````````````````
 
-dict Data
-`````````
+Service Data elements to include in the Advertising Data.
 
-	Advertising Data to include. Key is the advertising type and value is
-	the data as byte array.
+The keys are the UUID to associate with the data.
 
-	Note: Types already handled by other properties shall not be used.
+dict Data [readonly, optional]
+``````````````````````````````
 
-	Possible values:
+Advertising Data to include.
 
-	:<type>:
+Key is the advertising type and value is the data as byte array.
 
-		<byte array>
+Note: Types already handled by other properties shall not be used.
 
-	Example:
-		<Transport Discovery> <Organization Flags...>
-		0x26                   0x01         0x01...
+Possible values:
 
-bool Discoverable
-`````````````````
+:<type>:
 
-	Advertise as general discoverable. When present this will override
-	adapter Discoverable property.
+	<byte array>
 
-	Note: This property shall not be set when **Type** is set to
-	"broadcast".
+Example:
+	<Transport Discovery> <Organization Flags...>
+	0x26                   0x01         0x01...
 
-uint16 DiscoverableTimeout
-``````````````````````````
+array{string} ScanResponseServiceUUIDs [readonly, optional, experimental]
+`````````````````````````````````````````````````````````````````````````
 
-	The discoverable timeout in seconds. A value of zero means that the
-	timeout is disabled and it will stay in discoverable/limited mode
-	forever.
+List of UUIDs to include in the "Service UUID" field of the Scan Response Data.
 
-	Note: This property shall not be set when **Type** is set to
-	"broadcast".
+dict ScanResponseManufacturerData [readonly, optional, experimental]
+````````````````````````````````````````````````````````````````````
 
-array{string} Includes
-``````````````````````
+Manufacturer Data fields to include in the Scan Response Data.
 
-	List of features to be included in the advertising packet.
+Keys are the Manufacturer ID to associate with the data.
 
-	Possible values:
+array{string} ScanResponseSolicitUUIDs [readonly, optional, experimental]
+`````````````````````````````````````````````````````````````````````````
 
-	See **org.bluez.LEAdvertisingManager(5)** **SupportedIncludes**
-	property.
+List of UUIDs to include in the "Service Solicitation" field of the Scan
+Response Data.
 
-string LocalName
-````````````````
+dict ScanResponseServiceData [readonly, optional, experimental]
+```````````````````````````````````````````````````````````````
 
-	Local name to be used in the advertising report. If the string is too
-	big to fit into the packet it will be truncated.
+Service Data elements to include in the Scan Response Data.
 
-	If this property is available 'local-name' cannot be present in the
-	**Includes**.
+The keys are the UUID to associate with the data.
 
-uint16 Appearance
-`````````````````
+dict ScanResponseData [readonly, optional, experimental]
+````````````````````````````````````````````````````````
 
-	Appearance to be used in the advertising report.
+Scan Response Data to include.
 
-	Possible values: as found on GAP Service.
+Key is the advertising type and value is the data as byte array.
 
-uint16_t Duration
-`````````````````
+bool Discoverable [readonly, optional]
+``````````````````````````````````````
 
-	Rotation duration of the advertisement in seconds. If there are other
-	applications advertising no duration is set the default is 2 seconds.
+Advertise as general discoverable. When present this will override adapter
+Discoverable property.
 
-uint16_t Timeout
-````````````````
+Note: This property shall not be set when **Type** is set to "broadcast".
 
-	Timeout of the advertisement in seconds. This defines the lifetime of
-	the advertisement.
+uint16 DiscoverableTimeout [readonly, optional]
+```````````````````````````````````````````````
 
-string SecondaryChannel
-```````````````````````
+The discoverable timeout in seconds. A value of zero means that the timeout is
+disabled and it will stay in discoverable/limited mode forever.
 
-	Secondary channel to be used. Primary channel is always set to "1M"
-	except when "Coded" is set.
+Note: This property shall not be set when **Type** is set to "broadcast".
 
-	Possible value:
+array{string} Includes [readonly, optional]
+```````````````````````````````````````````
 
-	:"1M" (default):
-	:"2M":
-	:"Coded":
+List of features to be included in the advertising packet.
 
-uint32 MinInterval
-``````````````````
+Possible values:
 
-	Minimum advertising interval to be used by the advertising set, in
-	milliseconds. Acceptable values are in the range [20ms, 10,485s].
-	If the provided MinInterval is larger than the provided MaxInterval,
-	the registration will return failure.
+See **org.bluez.LEAdvertisingManager(5)** **SupportedIncludes** property.
 
-uint32 MaxInterval
-``````````````````
+string LocalName [readonly, optional]
+`````````````````````````````````````
 
-	Maximum advertising interval to be used by the advertising set, in
-	milliseconds. Acceptable values are in the range [20ms, 10,485s]. If the
-	provided MinInterval is larger than the provided MaxInterval, the
-	registration will return failure.
+Local name to be used in the advertising report. If the string is too big to
+fit into the packet it will be truncated.
 
-int16 TxPower
-`````````````
+If this property is available 'local-name' cannot be present in the
+**Includes**.
 
-	Requested transmission power of this advertising set. The provided value
-	is used only if the "CanSetTxPower" feature is enabled on the
-	**org.bluez.LEAdvertisingManager(5)**. The provided value must be in
-	range [-127 to +20], where units are in dBm.
+uint16 Appearance [readonly, optional]
+``````````````````````````````````````
+
+Appearance to be used in the advertising report.
+
+Possible values: as found on GAP Service.
+
+uint16 Duration [readonly, optional]
+````````````````````````````````````
+
+Rotation duration of the advertisement in seconds.
+
+If there are other applications advertising no duration is set the default is
+2 seconds.
+
+uint16 Timeout [readonly, optional]
+`````````````````````````````````````
+
+Timeout of the advertisement in seconds. This defines the lifetime of the
+advertisement.
+
+string SecondaryChannel [readonly, optional]
+````````````````````````````````````````````
+
+Secondary channel to be used.
+
+Primary channel is always set to "1M" except when "Coded" is set.
+
+Possible value:
+
+:"1M" (default):
+:"2M":
+:"Coded":
+
+uint32 MinInterval [readonly, optional]
+```````````````````````````````````````
+
+Minimum advertising interval to be used by the advertising set, in milliseconds.
+
+Acceptable values are in the range [20ms, 10,485s].
+
+If the provided MinInterval is larger than the provided MaxInterval, the
+registration will return failure.
+
+uint32 MaxInterval [readonly, optional]
+```````````````````````````````````````
+
+Maximum advertising interval to be used by the advertising set, in milliseconds.
+
+Acceptable values are in the range [20ms, 10,485s].
+
+If the provided MinInterval is larger than the provided MaxInterval, the
+registration will return failure.
+
+int16 TxPower [readonly, optional]
+``````````````````````````````````
+
+Requested transmission power of this advertising set.
+
+The provided value is used only if the "CanSetTxPower" feature is enabled on the
+**org.bluez.LEAdvertisingManager(5)**.
+
+Values must be in range [-127 to +20], where units are in dBm.

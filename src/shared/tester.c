@@ -654,6 +654,8 @@ static void test_result(enum test_result result)
 		test->timeout_id = 0;
 	}
 
+	tester_shutdown_io();
+
 	if (test->result == TEST_RESULT_FAILED)
 		result = TEST_RESULT_FAILED;
 
@@ -978,6 +980,9 @@ static bool test_io_recv(struct io *io, void *user_data)
 	if (!iov)
 		return true;
 
+	if (test->iovcnt && !iov->iov_base)
+		iov = test_get_iov(test);
+
 	g_assert_cmpint(len, ==, iov->iov_len);
 
 	if (memcmp(buf, iov->iov_base, len))
@@ -1042,6 +1047,12 @@ struct io *tester_setup_io(const struct iovec *iov, int iovcnt)
 	test->iovcnt = iovcnt;
 
 	return ios[0];
+}
+
+void tester_shutdown_io(void)
+{
+	io_shutdown(ios[0]);
+	io_shutdown(ios[1]);
 }
 
 void tester_io_send(void)

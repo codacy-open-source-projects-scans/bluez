@@ -32,10 +32,12 @@
 
 #define VCP_STEP_SIZE 1
 
+#define VCP_CLIENT_OP_TIMEOUT		2000
+
 #define VOCS_VOL_OFFSET_UPPER_LIMIT	 255
 #define VOCS_VOL_OFFSET_LOWER_LIMIT	-255
 
-/* Apllication Error Code */
+/* Application Error Code */
 #define BT_ATT_ERROR_INVALID_CHANGE_COUNTER	0x80
 #define BT_ATT_ERROR_OPCODE_NOT_SUPPORTED	0x81
 #define BT_ATT_ERROR_VALUE_OUT_OF_RANGE		0x82
@@ -147,6 +149,12 @@ struct bt_vcs_ab_vol {
 	uint8_t	vol_set;
 } __packed;
 
+struct bt_vcs_client_ab_vol {
+	uint8_t	op;
+	uint8_t	change_counter;
+	uint8_t	vol_set;
+} __packed;
+
 struct bt_vocs_set_vol_off {
 	uint8_t	change_counter;
 	int16_t set_vol_offset;
@@ -168,6 +176,14 @@ struct bt_vcp_notify {
 	struct bt_vcp *vcp;
 	vcp_notify_t func;
 	void *user_data;
+};
+
+struct bt_vcp_client_op {
+	uint8_t volume;
+	bool resend;
+	bool wait_reply;
+	bool wait_notify;
+	unsigned int timeout_id;
 };
 
 struct bt_vcp {
@@ -192,6 +208,13 @@ struct bt_vcp {
 
 	bt_vcp_debug_func_t debug_func;
 	bt_vcp_destroy_func_t debug_destroy;
+	bt_vcp_volume_func_t volume_changed;
+
+	uint8_t volume;
+	uint8_t volume_counter;
+
+	struct bt_vcp_client_op pending_op;
+
 	void *debug_data;
 	void *user_data;
 };
@@ -280,17 +303,24 @@ static struct queue *vcp_db;
 static struct queue *vcp_cbs;
 static struct queue *sessions;
 
-static void *iov_pull_mem(struct iovec *iov, size_t len)
+static char *iov_pull_string(struct iovec *iov)
 {
-	void *data = iov->iov_base;
+	char *res;
 
-	if (iov->iov_len < len)
+	if (!iov)
 		return NULL;
 
-	iov->iov_base += len;
-	iov->iov_len -= len;
+	res = malloc(iov->iov_len + 1);
+	if (!res)
+		return NULL;
 
-	return data;
+	if (iov->iov_len)
+		memcpy(res, iov->iov_base, iov->iov_len);
+
+	res[iov->iov_len] = 0;
+
+	util_iov_pull(iov, iov->iov_len);
+	return res;
 }
 
 static struct bt_vcp_db *vcp_get_vdb(struct bt_vcp *vcp)
@@ -368,7 +398,15 @@ static struct bt_aics *vcp_get_aics(struct bt_vcp *vcp)
 	return vcp->rdb->aics;
 }
 
-static void vcp_detached(void *data, void *user_data)
+static void vcp_remote_client_attached(void *data, void *user_data)
+{
+	struct bt_vcp_cb *cb = data;
+	struct bt_vcp *vcp = user_data;
+
+	cb->attached(vcp, cb->user_data);
+}
+
+static void vcp_remote_client_detached(void *data, void *user_data)
 {
 	struct bt_vcp_cb *cb = data;
 	struct bt_vcp *vcp = user_data;
@@ -376,15 +414,25 @@ static void vcp_detached(void *data, void *user_data)
 	cb->detached(vcp, cb->user_data);
 }
 
+static void vcp_client_op_clear(struct bt_vcp_client_op *op)
+{
+	if (op->timeout_id)
+		timeout_remove(op->timeout_id);
+
+	memset(op, 0, sizeof(*op));
+}
+
 void bt_vcp_detach(struct bt_vcp *vcp)
 {
 	if (!queue_remove(sessions, vcp))
 		return;
 
-	bt_gatt_client_unref(vcp->client);
-	vcp->client = NULL;
+	if (vcp->client) {
+		bt_gatt_client_unref(vcp->client);
+		vcp->client = NULL;
+	}
 
-	queue_foreach(vcp_cbs, vcp_detached, vcp);
+	vcp_client_op_clear(&vcp->pending_op);
 }
 
 static void vcp_db_free(void *data)
@@ -478,11 +526,13 @@ static void vcp_debug(struct bt_vcp *vcp, const char *format, ...)
 
 static void vcp_disconnected(int err, void *user_data)
 {
+	/* called only when this device is acting a a server */
 	struct bt_vcp *vcp = user_data;
 
 	DBG(vcp, "vcp %p disconnected err %d", vcp, err);
 
 	bt_vcp_detach(vcp);
+	queue_foreach(vcp_cbs, vcp_remote_client_detached, vcp);
 }
 
 static struct bt_vcp *vcp_get_session(struct bt_att *att, struct gatt_db *db)
@@ -497,12 +547,17 @@ static struct bt_vcp *vcp_get_session(struct bt_att *att, struct gatt_db *db)
 			return vcp;
 	}
 
+	/* called only when this device is acting a a server */
 	vcp = bt_vcp_new(db, NULL);
 	vcp->att = att;
 
+	queue_foreach(vcp_cbs, vcp_remote_client_attached, vcp);
+
 	bt_att_register_disconnect(att, vcp_disconnected, vcp, NULL);
 
-	bt_vcp_attach(vcp, NULL);
+	if (!sessions)
+		sessions = queue_new();
+	queue_push_tail(sessions, vcp);
 
 	return vcp;
 
@@ -529,7 +584,7 @@ static uint8_t vcs_rel_vol_down(struct bt_vcs *vcs, struct bt_vcp *vcp,
 		return 0;
 	}
 
-	change_counter = iov_pull_mem(iov, sizeof(*change_counter));
+	change_counter = util_iov_pull_mem(iov, sizeof(*change_counter));
 	if (!change_counter)
 		return 0;
 
@@ -540,6 +595,10 @@ static uint8_t vcs_rel_vol_down(struct bt_vcs *vcs, struct bt_vcp *vcp,
 
 	vstate->vol_set = MAX((vstate->vol_set - VCP_STEP_SIZE), 0);
 	vstate->counter = -~vstate->counter; /*Increment Change Counter*/
+	vcp->volume = vstate->vol_set;
+
+	if (vcp->volume_changed)
+		vcp->volume_changed(vcp, vcp->volume);
 
 	gatt_db_attribute_notify(vdb->vcs->vs, (void *)vstate,
 				 sizeof(struct vol_state),
@@ -568,7 +627,7 @@ static uint8_t vcs_rel_vol_up(struct bt_vcs *vcs, struct bt_vcp *vcp,
 		return 0;
 	}
 
-	change_counter = iov_pull_mem(iov, sizeof(*change_counter));
+	change_counter = util_iov_pull_mem(iov, sizeof(*change_counter));
 	if (!change_counter)
 		return 0;
 
@@ -579,6 +638,10 @@ static uint8_t vcs_rel_vol_up(struct bt_vcs *vcs, struct bt_vcp *vcp,
 
 	vstate->vol_set = MIN((vstate->vol_set + VCP_STEP_SIZE), 255);
 	vstate->counter = -~vstate->counter; /*Increment Change Counter*/
+	vcp->volume = vstate->vol_set;
+
+	if (vcp->volume_changed)
+		vcp->volume_changed(vcp, vcp->volume);
 
 	gatt_db_attribute_notify(vdb->vcs->vs, (void *)vstate,
 				 sizeof(struct vol_state),
@@ -607,7 +670,7 @@ static uint8_t vcs_unmute_rel_vol_down(struct bt_vcs *vcs, struct bt_vcp *vcp,
 		return 0;
 	}
 
-	change_counter = iov_pull_mem(iov, sizeof(*change_counter));
+	change_counter = util_iov_pull_mem(iov, sizeof(*change_counter));
 	if (!change_counter)
 		return 0;
 
@@ -619,6 +682,10 @@ static uint8_t vcs_unmute_rel_vol_down(struct bt_vcs *vcs, struct bt_vcp *vcp,
 	vstate->mute = 0x00;
 	vstate->vol_set = MAX((vstate->vol_set - VCP_STEP_SIZE), 0);
 	vstate->counter = -~vstate->counter; /*Increment Change Counter*/
+	vcp->volume = vstate->vol_set;
+
+	if (vcp->volume_changed)
+		vcp->volume_changed(vcp, vcp->volume);
 
 	gatt_db_attribute_notify(vdb->vcs->vs, (void *)vstate,
 				 sizeof(struct vol_state),
@@ -647,7 +714,7 @@ static uint8_t vcs_unmute_rel_vol_up(struct bt_vcs *vcs, struct bt_vcp *vcp,
 		return 0;
 	}
 
-	change_counter = iov_pull_mem(iov, sizeof(*change_counter));
+	change_counter = util_iov_pull_mem(iov, sizeof(*change_counter));
 	if (!change_counter)
 		return 0;
 
@@ -659,6 +726,10 @@ static uint8_t vcs_unmute_rel_vol_up(struct bt_vcs *vcs, struct bt_vcp *vcp,
 	vstate->mute = 0x00;
 	vstate->vol_set = MIN((vstate->vol_set + VCP_STEP_SIZE), 255);
 	vstate->counter = -~vstate->counter; /*Increment Change Counter*/
+	vcp->volume = vstate->vol_set;
+
+	if (vcp->volume_changed)
+		vcp->volume_changed(vcp, vcp->volume);
 
 	gatt_db_attribute_notify(vdb->vcs->vs, (void *)vstate,
 				 sizeof(struct vol_state),
@@ -687,7 +758,7 @@ static uint8_t vcs_set_absolute_vol(struct bt_vcs *vcs, struct bt_vcp *vcp,
 		return 0;
 	}
 
-	req = iov_pull_mem(iov, sizeof(*req));
+	req = util_iov_pull_mem(iov, sizeof(*req));
 	if (!req)
 		return 0;
 
@@ -698,6 +769,10 @@ static uint8_t vcs_set_absolute_vol(struct bt_vcs *vcs, struct bt_vcp *vcp,
 
 	vstate->vol_set = req->vol_set;
 	vstate->counter = -~vstate->counter; /*Increment Change Counter*/
+	vcp->volume = vstate->vol_set;
+
+	if (vcp->volume_changed)
+		vcp->volume_changed(vcp, vcp->volume);
 
 	gatt_db_attribute_notify(vdb->vcs->vs, (void *)vstate,
 				 sizeof(struct vol_state),
@@ -726,7 +801,7 @@ static uint8_t vcs_unmute(struct bt_vcs *vcs, struct bt_vcp *vcp,
 		return 0;
 	}
 
-	change_counter = iov_pull_mem(iov, sizeof(*change_counter));
+	change_counter = util_iov_pull_mem(iov, sizeof(*change_counter));
 	if (!change_counter)
 		return 0;
 
@@ -765,7 +840,7 @@ static uint8_t vcs_mute(struct bt_vcs *vcs, struct bt_vcp *vcp,
 		return 0;
 	}
 
-	change_counter = iov_pull_mem(iov, sizeof(*change_counter));
+	change_counter = util_iov_pull_mem(iov, sizeof(*change_counter));
 	if (!change_counter)
 		return 0;
 
@@ -801,7 +876,7 @@ static uint8_t vocs_set_vol_offset(struct bt_vocs *vocs, struct bt_vcp *vcp,
 		return 0;
 	}
 
-	req = iov_pull_mem(iov, sizeof(*req));
+	req = util_iov_pull_mem(iov, sizeof(*req));
 	if (!req)
 		return 0;
 
@@ -924,9 +999,9 @@ static void vcs_cp_write(struct gatt_db_attribute *attrib,
 		goto respond;
 	}
 
-	vcp_op = iov_pull_mem(&iov, sizeof(*vcp_op));
+	vcp_op = util_iov_pull_mem(&iov, sizeof(*vcp_op));
 	if (!vcp_op) {
-		DBG(vcp, "iov_pull_mem() returned NULL");
+		DBG(vcp, "util_iov_pull_mem() returned NULL");
 		goto respond;
 	}
 
@@ -988,9 +1063,9 @@ static void vocs_cp_write(struct gatt_db_attribute *attrib,
 		goto respond;
 	}
 
-	vcp_op = iov_pull_mem(&iov, sizeof(*vcp_op));
+	vcp_op = util_iov_pull_mem(&iov, sizeof(*vcp_op));
 	if (!vcp_op) {
-		DBG(vcp, "iov_pull_mem() returned NULL");
+		DBG(vcp, "util_iov_pull_mem() returned NULL");
 		goto respond;
 	}
 
@@ -1202,7 +1277,7 @@ static uint8_t aics_set_gain_setting(struct bt_aics *aics,
 
 	}
 
-	req = iov_pull_mem(iov, sizeof(*req));
+	req = util_iov_pull_mem(iov, sizeof(*req));
 	if (!req) {
 		ret = 0;
 		goto respond;
@@ -1265,7 +1340,7 @@ static uint8_t aics_unmute(struct bt_aics *aics, struct bt_vcp *vcp,
 		goto respond;
 
 	}
-	change_counter = iov_pull_mem(iov, sizeof(*change_counter));
+	change_counter = util_iov_pull_mem(iov, sizeof(*change_counter));
 	if (!change_counter) {
 		ret = 0;
 		goto respond;
@@ -1317,7 +1392,7 @@ static uint8_t aics_mute(struct bt_aics *aics, struct bt_vcp *vcp,
 		ret = 0;
 		goto respond;
 	}
-	change_counter = iov_pull_mem(iov, sizeof(*change_counter));
+	change_counter = util_iov_pull_mem(iov, sizeof(*change_counter));
 	if (!change_counter) {
 		ret = 0;
 		goto respond;
@@ -1369,7 +1444,7 @@ static uint8_t aics_set_manual_gain_mode(struct bt_aics *aics,
 		goto respond;
 	}
 
-	change_counter = iov_pull_mem(iov, sizeof(*change_counter));
+	change_counter = util_iov_pull_mem(iov, sizeof(*change_counter));
 	if (!change_counter) {
 		ret = 0;
 		goto respond;
@@ -1428,7 +1503,7 @@ static uint8_t aics_set_auto_gain_mode(struct bt_aics *aics, struct bt_vcp *vcp,
 		ret = 0;
 		goto respond;
 	}
-	change_counter = iov_pull_mem(iov, sizeof(*change_counter));
+	change_counter = util_iov_pull_mem(iov, sizeof(*change_counter));
 	if (!change_counter) {
 		ret = 0;
 		goto respond;
@@ -1524,9 +1599,9 @@ static void aics_ip_cp_write(struct gatt_db_attribute *attrib,
 		goto respond;
 	}
 
-	aics_op = iov_pull_mem(&iov, sizeof(*aics_op));
+	aics_op = util_iov_pull_mem(&iov, sizeof(*aics_op));
 	if (!aics_op) {
-		DBG(vcp, "iov_pull_mem() returned NULL");
+		DBG(vcp, "util_iov_pull_mem() returned NULL");
 		goto respond;
 	}
 
@@ -1874,6 +1949,15 @@ bool bt_vcp_set_debug(struct bt_vcp *vcp, bt_vcp_debug_func_t func,
 	return true;
 }
 
+bool bt_vcp_set_volume_callback(struct bt_vcp *vcp,
+				bt_vcp_volume_func_t volume_changed)
+{
+	if (!vcp)
+		return false;
+
+	vcp->volume_changed = volume_changed;
+	return true;
+}
 unsigned int bt_vcp_register(bt_vcp_func_t attached, bt_vcp_func_t detached,
 							void *user_data)
 {
@@ -1948,44 +2032,202 @@ done:
 	return vcp;
 }
 
+static void vcp_set_volume_complete(struct bt_vcp *vcp)
+{
+	bool resend = vcp->pending_op.resend;
+	uint8_t volume = vcp->pending_op.volume;
+
+	vcp_client_op_clear(&vcp->pending_op);
+
+	/* If there were more volume set ops while waiting for the one that
+	 * completes, send request to set volume to the latest pending value.
+	 */
+	if (resend) {
+		DBG(vcp, "set pending volume 0x%x", volume);
+		bt_vcp_set_volume(vcp, volume);
+	}
+}
+
 static void vcp_vstate_notify(struct bt_vcp *vcp, uint16_t value_handle,
 				const uint8_t *value, uint16_t length,
 				void *user_data)
 {
-	struct vol_state vstate;
+	struct iovec iov = { .iov_base = (void *)value, .iov_len = length };
+	struct vol_state *vstate;
 
-	memcpy(&vstate, value, sizeof(struct vol_state));
+	vstate = util_iov_pull_mem(&iov, sizeof(*vstate));
+	if (!vstate) {
+		DBG(vcp, "Invalid Vol State");
+		return;
+	}
 
-	DBG(vcp, "Vol Settings 0x%x", vstate.vol_set);
-	DBG(vcp, "Mute Status 0x%x", vstate.mute);
-	DBG(vcp, "Vol Counter 0x%x", vstate.counter);
+	DBG(vcp, "Vol Settings 0x%x", vstate->vol_set);
+	DBG(vcp, "Mute Status 0x%x", vstate->mute);
+	DBG(vcp, "Vol Counter 0x%x", vstate->counter);
+
+	vcp->volume = vstate->vol_set;
+	vcp->volume_counter = vstate->counter;
+
+	if (vcp->volume_changed)
+		vcp->volume_changed(vcp, vcp->volume);
+
+	vcp->pending_op.wait_notify = false;
+	if (!vcp->pending_op.wait_reply)
+		vcp_set_volume_complete(vcp);
+}
+
+static void vcp_volume_cp_sent(bool success, uint8_t err, void *user_data)
+{
+	struct bt_vcp *vcp = user_data;
+
+	if (!success) {
+		if (err == BT_ATT_ERROR_INVALID_CHANGE_COUNTER)
+			DBG(vcp, "setting volume failed: invalid counter");
+		else
+			DBG(vcp, "setting volume failed: error 0x%x", err);
+
+		vcp_set_volume_complete(vcp);
+	} else {
+		vcp->pending_op.wait_reply = false;
+		if (!vcp->pending_op.wait_notify)
+			vcp_set_volume_complete(vcp);
+	}
+}
+
+static bool vcp_set_volume_timeout(void *data)
+{
+	struct bt_vcp *vcp = data;
+
+	DBG(vcp, "setting volume: timeout");
+	vcp->pending_op.timeout_id = 0;
+	vcp_set_volume_complete(vcp);
+	return false;
+}
+
+static bool vcp_set_volume_client(struct bt_vcp *vcp, uint8_t volume)
+{
+	struct bt_vcs_client_ab_vol req;
+	uint16_t value_handle;
+	struct bt_vcs *vcs = vcp_get_vcs(vcp);
+
+	if (!vcs) {
+		DBG(vcp, "error: vcs not available");
+		return false;
+	}
+
+	if (!vcs->vol_cp) {
+		DBG(vcp, "error: vol_cp characteristics not available");
+		return false;
+	}
+
+	if (!gatt_db_attribute_get_char_data(vcs->vol_cp, NULL, &value_handle,
+							NULL, NULL, NULL)) {
+		DBG(vcp, "error: vol_cp characteristics not available");
+		return false;
+	}
+
+	/* If there is another set volume op in flight, just update the wanted
+	 * pending volume value. Req with the latest volume value is sent after
+	 * the current one completes. This may skip over some volume changes,
+	 * as it only sends a request for the final value.
+	 */
+	if (vcp->pending_op.timeout_id) {
+		vcp->pending_op.volume = volume;
+		vcp->pending_op.resend = true;
+		return true;
+	} else if (vcp->volume == volume) {
+		/* Do not set to current value, as that doesn't generate
+		 * a notification
+		 */
+		return true;
+	}
+
+	req.op = BT_VCS_SET_ABSOLUTE_VOL;
+	req.vol_set = volume;
+	req.change_counter = vcp->volume_counter;
+
+	if (!bt_gatt_client_write_value(vcp->client, value_handle, (void *)&req,
+					sizeof(req), vcp_volume_cp_sent, vcp,
+					NULL)) {
+		DBG(vcp, "error writing volume");
+		return false;
+	}
+
+	vcp->pending_op.timeout_id = timeout_add(VCP_CLIENT_OP_TIMEOUT,
+					vcp_set_volume_timeout, vcp, NULL);
+	vcp->pending_op.wait_notify = true;
+	vcp->pending_op.wait_reply = true;
+	return true;
+}
+
+static bool vcp_set_volume_server(struct bt_vcp *vcp, uint8_t volume)
+{
+	struct bt_vcp_db *vdb = vcp_get_vdb(vcp);
+	struct vol_state *vstate;
+
+	vcp->volume = volume;
+
+	if (!vdb) {
+		DBG(vcp, "error: VDB not available");
+		return false;
+	}
+
+	vstate = vdb_get_vstate(vdb);
+	if (!vstate) {
+		DBG(vcp, "error: VSTATE not available");
+		return false;
+	}
+
+	vstate->vol_set = vcp->volume;
+	vstate->counter = -~vstate->counter; /*Increment Change Counter*/
+	gatt_db_attribute_notify(vdb->vcs->vs, (void *) vstate,
+			sizeof(struct vol_state), bt_vcp_get_att(vcp));
+	return true;
+}
+
+bool bt_vcp_set_volume(struct bt_vcp *vcp, uint8_t volume)
+{
+	if (vcp->client)
+		return vcp_set_volume_client(vcp, volume);
+	else
+		return vcp_set_volume_server(vcp, volume);
+}
+
+uint8_t bt_vcp_get_volume(struct bt_vcp *vcp)
+{
+	return vcp->volume;
 }
 
 static void vcp_voffset_state_notify(struct bt_vcp *vcp, uint16_t value_handle,
 				const uint8_t *value, uint16_t length,
 				void *user_data)
 {
-	struct vol_offset_state vostate;
+	struct iovec iov = { .iov_base = (void *)value, .iov_len = length };
+	struct vol_offset_state *vostate;
 
-	memcpy(&vostate, value, sizeof(struct vol_offset_state));
+	vostate = util_iov_pull_mem(&iov, sizeof(*vostate));
+	if (!vostate) {
+		DBG(vcp, "Invalid Vol Offset State");
+		return;
+	}
 
-	DBG(vcp, "Vol Offset 0x%x", vostate.vol_offset);
-	DBG(vcp, "Vol Offset Counter 0x%x", vostate.counter);
+	DBG(vcp, "Vol Offset 0x%x", vostate->vol_offset);
+	DBG(vcp, "Vol Offset Counter 0x%x", vostate->counter);
 }
 
 static void vcp_audio_loc_notify(struct bt_vcp *vcp, uint16_t value_handle,
 				const uint8_t *value, uint16_t length,
 				void *user_data)
 {
-	uint32_t *vocs_audio_loc_n = malloc(sizeof(uint32_t));
-	*vocs_audio_loc_n = 0;
+	struct iovec iov = { .iov_base = (void *)value, .iov_len = length };
+	uint32_t audio_loc;
 
-	if (value != NULL)
-		memcpy(vocs_audio_loc_n, value, sizeof(uint32_t));
+	if (!util_iov_pull_le32(&iov, &audio_loc)) {
+		DBG(vcp, "Invalid VOCS Audio Location");
+		return;
+	}
 
-	DBG(vcp, "VOCS Audio Location 0x%x", *vocs_audio_loc_n);
-
-	free(vocs_audio_loc_n);
+	DBG(vcp, "VOCS Audio Location 0x%x", audio_loc);
 }
 
 
@@ -1995,20 +2237,29 @@ static void vcp_audio_descriptor_notify(struct bt_vcp *vcp,
 					uint16_t length,
 					void *user_data)
 {
-	char vocs_audio_dec_n[256] = {'\0'};
+	struct iovec iov = { .iov_base = (void *)value, .iov_len = length };
+	char *vocs_audio_dec;
 
-	memcpy(vocs_audio_dec_n, value, length);
+	vocs_audio_dec = iov_pull_string(&iov);
+	if (!vocs_audio_dec)
+		return;
 
-	DBG(vcp, "VOCS Audio Descriptor 0x%s", *vocs_audio_dec_n);
+	DBG(vcp, "VOCS Audio Descriptor 0x%s", vocs_audio_dec);
+
+	free(vocs_audio_dec);
 }
 
 static void vcp_vflag_notify(struct bt_vcp *vcp, uint16_t value_handle,
 			     const uint8_t *value, uint16_t length,
 			     void *user_data)
 {
+	struct iovec iov = { .iov_base = (void *)value, .iov_len = length };
 	uint8_t vflag;
 
-	memcpy(&vflag, value, sizeof(vflag));
+	if (!util_iov_pull_u8(&iov, &vflag)) {
+		DBG(vcp, "Invalid Vol Flag");
+		return;
+	}
 
 	DBG(vcp, "Vol Flag 0x%x", vflag);
 }
@@ -2017,24 +2268,20 @@ static void read_vol_flag(struct bt_vcp *vcp, bool success, uint8_t att_ecode,
 				const uint8_t *value, uint16_t length,
 				void *user_data)
 {
-	uint8_t *vol_flag;
-	struct iovec iov = {
-		.iov_base = (void *) value,
-		.iov_len = length,
-	};
+	struct iovec iov = { .iov_base = (void *) value, .iov_len = length };
+	uint8_t vol_flag;
 
 	if (!success) {
 		DBG(vcp, "Unable to read Vol Flag: error 0x%02x", att_ecode);
 		return;
 	}
 
-	vol_flag = iov_pull_mem(&iov, sizeof(*vol_flag));
-	if (!vol_flag) {
+	if (!util_iov_pull_u8(&iov, &vol_flag)) {
 		DBG(vcp, "Unable to get Vol Flag");
 		return;
 	}
 
-	DBG(vcp, "Vol Flag:%x", *vol_flag);
+	DBG(vcp, "Vol Flag:%x", vol_flag);
 }
 
 static void read_vol_state(struct bt_vcp *vcp, bool success, uint8_t att_ecode,
@@ -2052,7 +2299,7 @@ static void read_vol_state(struct bt_vcp *vcp, bool success, uint8_t att_ecode,
 		return;
 	}
 
-	vs = iov_pull_mem(&iov, sizeof(*vs));
+	vs = util_iov_pull_mem(&iov, sizeof(*vs));
 	if (!vs) {
 		DBG(vcp, "Unable to get Vol State");
 		return;
@@ -2061,6 +2308,9 @@ static void read_vol_state(struct bt_vcp *vcp, bool success, uint8_t att_ecode,
 	DBG(vcp, "Vol Set:%x", vs->vol_set);
 	DBG(vcp, "Vol Mute:%x", vs->mute);
 	DBG(vcp, "Vol Counter:%x", vs->counter);
+
+	vcp->volume = vs->vol_set;
+	vcp->volume_counter = vs->counter;
 }
 
 static void read_vol_offset_state(struct bt_vcp *vcp, bool success,
@@ -2080,7 +2330,7 @@ static void read_vol_offset_state(struct bt_vcp *vcp, bool success,
 		return;
 	}
 
-	vos = iov_pull_mem(&iov, sizeof(*vos));
+	vos = util_iov_pull_mem(&iov, sizeof(*vos));
 	if (!vos) {
 		DBG(vcp, "Unable to get Vol Offset State");
 		return;
@@ -2095,22 +2345,14 @@ static void read_vocs_audio_location(struct bt_vcp *vcp, bool success,
 				     const uint8_t *value, uint16_t length,
 				     void *user_data)
 {
+	struct iovec iov = { .iov_base = (void *)value, .iov_len = length };
 	uint32_t vocs_audio_loc;
-	struct iovec iov;
-
-	if (!value) {
-		DBG(vcp, "Unable to get VOCS Audio Location");
-		return;
-	}
 
 	if (!success) {
 		DBG(vcp, "Unable to read VOCS Audio Location: error 0x%02x",
 		    att_ecode);
 		return;
 	}
-
-	iov.iov_base = (void *)value;
-	iov.iov_len = length;
 
 	if (!util_iov_pull_le32(&iov, &vocs_audio_loc)) {
 		DBG(vcp, "Invalid size for VOCS Audio Location");
@@ -2126,12 +2368,8 @@ static void read_vocs_audio_descriptor(struct bt_vcp *vcp, bool success,
 				       const uint8_t *value, uint16_t length,
 				       void *user_data)
 {
-	char *vocs_ao_dec_r;
-
-	if (!value) {
-		DBG(vcp, "Unable to get VOCS Audio Location");
-		return;
-	}
+	struct iovec iov = { .iov_base = (void *)value, .iov_len = length };
+	char *vocs_ao_dec;
 
 	if (!success) {
 		DBG(vcp, "Unable to read VOCS Audio Descriptor: error 0x%02x",
@@ -2139,12 +2377,13 @@ static void read_vocs_audio_descriptor(struct bt_vcp *vcp, bool success,
 		return;
 	}
 
-	vocs_ao_dec_r = util_memdup(value, length + 1);
-	memset(vocs_ao_dec_r + length, 0, 1);
+	vocs_ao_dec = iov_pull_string(&iov);
+	if (!vocs_ao_dec)
+		return;
 
-	DBG(vcp, "VOCS Audio Descriptor: %s", vocs_ao_dec_r);
-	free(vocs_ao_dec_r);
-	vocs_ao_dec_r = NULL;
+	DBG(vcp, "VOCS Audio Descriptor: %s", vocs_ao_dec);
+
+	free(vocs_ao_dec);
 }
 
 static void vcp_pending_destroy(void *data)
@@ -2262,7 +2501,7 @@ static void foreach_vcs_char(struct gatt_db_attribute *attr, void *user_data)
 		DBG(vcp, "VCS Vol state found: handle 0x%04x", value_handle);
 
 		vcs = vcp_get_vcs(vcp);
-		if (!vcs || vcs->vs)
+		if (!vcs)
 			return;
 
 		vcs->vs = attr;
@@ -2279,7 +2518,7 @@ static void foreach_vcs_char(struct gatt_db_attribute *attr, void *user_data)
 		DBG(vcp, "VCS Volume CP found: handle 0x%04x", value_handle);
 
 		vcs = vcp_get_vcs(vcp);
-		if (!vcs || vcs->vol_cp)
+		if (!vcs)
 			return;
 
 		vcs->vol_cp = attr;
@@ -2291,7 +2530,7 @@ static void foreach_vcs_char(struct gatt_db_attribute *attr, void *user_data)
 		DBG(vcp, "VCS Vol Flag found: handle 0x%04x", value_handle);
 
 		vcs = vcp_get_vcs(vcp);
-		if (!vcs || vcs->vf)
+		if (!vcs)
 			return;
 
 		vcs->vf = attr;
@@ -2404,9 +2643,9 @@ static void read_aics_audio_ip_state(struct bt_vcp *vcp, bool success,
 		return;
 	}
 
-	ip_st = iov_pull_mem(&iov, sizeof(*ip_st));
+	ip_st = util_iov_pull_mem(&iov, sizeof(*ip_st));
 	if (!ip_st) {
-		DBG(vcp, "Unable to get Audio Input State");
+		DBG(vcp, "Invalid Audio Input State");
 		return;
 	}
 
@@ -2420,14 +2659,19 @@ static void aics_ip_state_notify(struct bt_vcp *vcp, uint16_t value_handle,
 				const uint8_t *value, uint16_t length,
 				void *user_data)
 {
-	struct aud_ip_st ip_st;
+	struct iovec iov = { .iov_base = (void *) value, .iov_len = length };
+	struct aud_ip_st *ip_st;
 
-	memcpy(&ip_st, value, sizeof(struct aud_ip_st));
+	ip_st = util_iov_pull_mem(&iov, sizeof(*ip_st));
+	if (!ip_st) {
+		DBG(vcp, "Invalid Audio Input State");
+		return;
+	}
 
-	DBG(vcp, "Audio Input State, Gain Setting:%d", ip_st.gain_setting);
-	DBG(vcp, "Audio Input State, Mute:%x", ip_st.mute);
-	DBG(vcp, "Audio Input State, Gain Mode:%x", ip_st.gain_mode);
-	DBG(vcp, "Audio Input State, Change Counter:%x", ip_st.chg_counter);
+	DBG(vcp, "Audio Input State, Gain Setting:%d", ip_st->gain_setting);
+	DBG(vcp, "Audio Input State, Mute:%x", ip_st->mute);
+	DBG(vcp, "Audio Input State, Gain Mode:%x", ip_st->gain_mode);
+	DBG(vcp, "Audio Input State, Change Counter:%x", ip_st->chg_counter);
 }
 
 static void read_aics_gain_setting_prop(struct bt_vcp *vcp, bool success,
@@ -2435,16 +2679,8 @@ static void read_aics_gain_setting_prop(struct bt_vcp *vcp, bool success,
 					 const uint8_t *value, uint16_t length,
 					 void *user_data)
 {
+	struct iovec iov = { .iov_base = (void *) value, .iov_len = length };
 	struct gain_setting_prop *aics_gain_setting_prop;
-	struct iovec iov = {
-		.iov_base = (void *) value,
-		.iov_len = length,
-	};
-
-	if (!value) {
-		DBG(vcp, "Unable to get Gain Setting Properties Char");
-		return;
-	}
 
 	if (!success) {
 		DBG(vcp,
@@ -2453,7 +2689,7 @@ static void read_aics_gain_setting_prop(struct bt_vcp *vcp, bool success,
 		return;
 	}
 
-	aics_gain_setting_prop = iov_pull_mem(&iov,
+	aics_gain_setting_prop = util_iov_pull_mem(&iov,
 				sizeof(*aics_gain_setting_prop));
 	if (!aics_gain_setting_prop) {
 		DBG(vcp, "Unable to get Gain Setting Properties Char");
@@ -2473,6 +2709,7 @@ static void read_aics_aud_ip_type(struct bt_vcp *vcp, bool success,
 					 const uint8_t *value, uint16_t length,
 					 void *user_data)
 {
+	struct iovec iov = { .iov_base = (void *) value, .iov_len = length };
 	uint8_t ip_type;
 
 	if (!success) {
@@ -2482,7 +2719,10 @@ static void read_aics_aud_ip_type(struct bt_vcp *vcp, bool success,
 		return;
 	}
 
-	memcpy(&ip_type, value, length);
+	if (!util_iov_pull_u8(&iov, &ip_type)) {
+		DBG(vcp, "Invalid Audio Input Type Char");
+		return;
+	}
 
 	DBG(vcp, "Audio Input Type : %x", ip_type);
 }
@@ -2492,6 +2732,7 @@ static void read_aics_audio_ip_status(struct bt_vcp *vcp, bool success,
 					 const uint8_t *value, uint16_t length,
 					 void *user_data)
 {
+	struct iovec iov = { .iov_base = (void *) value, .iov_len = length };
 	uint8_t ip_status;
 
 	if (!success) {
@@ -2500,7 +2741,10 @@ static void read_aics_audio_ip_status(struct bt_vcp *vcp, bool success,
 		return;
 	}
 
-	memcpy(&ip_status, value, length);
+	if (!util_iov_pull_u8(&iov, &ip_status)) {
+		DBG(vcp, "Invalid Audio Input Status Char");
+		return;
+	}
 
 	DBG(vcp, "Audio Input Status : %x", ip_status);
 }
@@ -2510,9 +2754,13 @@ static void aics_ip_status_notify(struct bt_vcp *vcp, uint16_t value_handle,
 				uint16_t length,
 				void *user_data)
 {
+	struct iovec iov = { .iov_base = (void *) value, .iov_len = length };
 	uint8_t	ip_status;
 
-	memcpy(&ip_status, value, length);
+	if (!util_iov_pull_u8(&iov, &ip_status)) {
+		DBG(vcp, "Invalid Audio Input Status Char");
+		return;
+	}
 
 	DBG(vcp, "Audio Input Status, %x", ip_status);
 }
@@ -2523,12 +2771,8 @@ static void read_aics_audio_ip_description(struct bt_vcp *vcp, bool success,
 					   uint16_t length,
 					   void *user_data)
 {
+	struct iovec iov = { .iov_base = (void *) value, .iov_len = length };
 	char *ip_descrptn;
-
-	if (!value) {
-		DBG(vcp, "Unable to get Audio Input Description");
-		return;
-	}
 
 	if (!success) {
 		DBG(vcp,
@@ -2537,27 +2781,29 @@ static void read_aics_audio_ip_description(struct bt_vcp *vcp, bool success,
 		return;
 	}
 
-	ip_descrptn = util_memdup(value, length + 1);
-	memset(ip_descrptn + length, 0, 1);
+	ip_descrptn = iov_pull_string(&iov);
+	if (!ip_descrptn)
+		return;
 
 	DBG(vcp, "Audio Input Description: %s", ip_descrptn);
+
 	free(ip_descrptn);
-	ip_descrptn = NULL;
 }
 
 static void aics_audio_ip_desr_notify(struct bt_vcp *vcp, uint16_t value_handle,
 				const uint8_t *value, uint16_t length,
 				void *user_data)
 {
+	struct iovec iov = { .iov_base = (void *) value, .iov_len = length };
 	char *aud_ip_desr;
 
-	aud_ip_desr = malloc(length+1);
-	memset(aud_ip_desr, 0, length+1);
-	memcpy(aud_ip_desr, value, length);
+	aud_ip_desr = iov_pull_string(&iov);
+	if (!aud_ip_desr)
+		return;
 
 	DBG(vcp, "Audio Input Description Notify, %s", aud_ip_desr);
+
 	free(aud_ip_desr);
-	aud_ip_desr = NULL;
 }
 
 static void foreach_aics_char(struct gatt_db_attribute *attr, void *user_data)
@@ -2688,6 +2934,9 @@ static void foreach_vcs_service(struct gatt_db_attribute *attr,
 	struct bt_vcp *vcp = user_data;
 	struct bt_vcs *vcs = vcp_get_vcs(vcp);
 
+	if (!vcs)
+		return;
+
 	vcs->service = attr;
 
 	gatt_db_service_set_claimed(attr, true);
@@ -2757,4 +3006,3 @@ bool bt_vcp_attach(struct bt_vcp *vcp, struct bt_gatt_client *client)
 
 	return true;
 }
-

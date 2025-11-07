@@ -551,7 +551,7 @@ static bool can_write_data(struct io *io, void *user_data)
 	if (!op)
 		return false;
 
-	if (!bt_att_chan_write(chan, op->opcode, op->pdu, op->len)) {
+	if (bt_att_chan_write(chan, op->opcode, op->pdu, op->len) < 0) {
 		if (op->callback)
 			op->callback(BT_ATT_OP_ERROR_RSP, NULL, 0,
 							op->user_data);
@@ -669,7 +669,7 @@ static bool disconnect_cb(struct io *io, void *user_data)
 
 	DBG(att, "Channel %p disconnected: %s", chan, strerror(err));
 
-	/* Dettach channel */
+	/* Detach channel */
 	queue_remove(att->chans, chan);
 
 	if (chan->pending_req) {
@@ -731,6 +731,13 @@ static bool bt_att_chan_set_security(struct bt_att_chan *chan, int level)
 		chan->sec_level = level;
 		return true;
 	}
+
+	/* Check if security level has already been set, if the security level
+	 * is higher it shall satisfy the request since we never want to
+	 * downgrade security.
+	 */
+	if (level <= bt_att_chan_get_security(chan))
+		return true;
 
 	memset(&sec, 0, sizeof(sec));
 	sec.level = level;

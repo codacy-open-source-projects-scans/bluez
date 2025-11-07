@@ -47,6 +47,7 @@ extern "C" {
 #define HCI_I2C		8
 #define HCI_SMD		9
 #define HCI_VIRTIO	10
+#define HCI_IPC		11
 
 /* HCI controller types */
 #define HCI_PRIMARY	0x00
@@ -2310,6 +2311,12 @@ typedef struct {
 } __attribute__ ((packed))	hci_msg_hdr;
 #define HCI_MSG_HDR_SIZE	6
 
+typedef struct {
+	uint16_t	handle;
+	uint16_t	dlen;
+} __attribute__ ((packed))	hci_iso_hdr;
+#define HCI_ISO_HDR_SIZE	4
+
 /* Command opcode pack/unpack */
 #define cmd_opcode_pack(ogf, ocf)	(uint16_t)((ocf & 0x03ff)|(ogf << 10))
 #define cmd_opcode_ogf(op)		(op >> 10)
@@ -2319,6 +2326,11 @@ typedef struct {
 #define acl_handle_pack(h, f)	(uint16_t)((h & 0x0fff)|(f << 12))
 #define acl_handle(h)		(h & 0x0fff)
 #define acl_flags(h)		(h >> 12)
+
+/* ISO handle and flags pack/unpack */
+#define iso_flags_pb(f)		(f & 0x0003)
+#define iso_flags_ts(f)		((f >> 2) & 0x0001)
+#define iso_flags_pack(pb, ts)	((pb & 0x03) | ((ts & 0x01) << 2))
 
 #endif /* _NO_HCI_DEFS */
 

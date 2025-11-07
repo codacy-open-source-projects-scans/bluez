@@ -696,6 +696,8 @@ void gatt_read_local_attribute(char *data, int argc, char *argv[])
 		bt_shell_hexdump(&d->value[offset], d->value_len - offset);
 		return bt_shell_noninteractive_quit(EXIT_SUCCESS);
 	}
+
+	return bt_shell_noninteractive_quit(EXIT_FAILURE);
 }
 
 static uint8_t *str2bytearray(char *arg, size_t *val_len)
@@ -809,6 +811,8 @@ void gatt_write_local_attribute(char *data, int argc, char *argv[])
 	}
 
 	free(value);
+
+	return bt_shell_noninteractive_quit(EXIT_SUCCESS);
 }
 
 static char *attribute_generator(const char *text, int state, GList *source)
@@ -3207,7 +3211,7 @@ static void proxy_property_changed(GDBusProxy *proxy, const char *name,
 			chrc->path, bt_uuidstr_to_str(chrc->uuid), name);
 
 	if (!strcmp(name, "Value")) {
-		uint8_t *value = '\0';  /* don't pass NULL to write_value() */
+		uint8_t *value = NULL;
 		int len = 0;
 
 		if (iter && dbus_message_iter_get_arg_type(iter) ==

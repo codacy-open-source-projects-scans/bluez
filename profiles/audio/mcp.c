@@ -72,21 +72,12 @@ static void mcp_debug(const char *str, void *user_data)
 static char *name2utf8(const uint8_t *name, uint16_t len)
 {
 	char utf8_name[HCI_MAX_NAME_LENGTH + 2];
-	int i;
-
-	if (g_utf8_validate((const char *) name, len, NULL))
-		return g_strndup((char *) name, len);
 
 	len = MIN(len, sizeof(utf8_name) - 1);
 
 	memset(utf8_name, 0, sizeof(utf8_name));
 	strncpy(utf8_name, (char *) name, len);
-
-	/* Assume ASCII, and replace all non-ASCII with spaces */
-	for (i = 0; utf8_name[i] != '\0'; i++) {
-		if (!isascii(utf8_name[i]))
-			utf8_name[i] = ' ';
-	}
+	strtoutf8(utf8_name, len);
 
 	/* Remove leading and trailing whitespace characters */
 	g_strstrip(utf8_name);
@@ -190,17 +181,12 @@ static void cb_media_state(struct bt_mcp *mcp, uint8_t status)
 }
 
 static const struct bt_mcp_event_callback cbs = {
-	.player_name			= &cb_player_name,
-	.track_changed			= &cb_track_changed,
-	.track_title			= &cb_track_title,
-	.track_duration			= &cb_track_duration,
-	.track_position			= &cb_track_position,
-	.playback_speed			= NULL,
-	.seeking_speed			= NULL,
-	.play_order				= NULL,
-	.play_order_supported	= NULL,
-	.media_state			= &cb_media_state,
-	.content_control_id		= NULL,
+	.player_name			= cb_player_name,
+	.track_changed			= cb_track_changed,
+	.track_title			= cb_track_title,
+	.track_duration			= cb_track_duration,
+	.track_position			= cb_track_position,
+	.media_state			= cb_media_state,
 };
 
 static int ct_play(struct media_player *mp, void *user_data)
@@ -239,23 +225,11 @@ static int ct_previous(struct media_player *mp, void *user_data)
 }
 
 static const struct media_player_callback ct_cbs = {
-	.set_setting	= NULL,
-	.play		= &ct_play,
-	.pause		= &ct_pause,
-	.stop		= &ct_stop,
-	.next		= &ct_next,
-	.previous	= &ct_previous,
-	.fast_forward	= NULL,
-	.rewind		= NULL,
-	.press		= NULL,
-	.hold		= NULL,
-	.release	= NULL,
-	.list_items	= NULL,
-	.change_folder	= NULL,
-	.search		= NULL,
-	.play_item	= NULL,
-	.add_to_nowplaying = NULL,
-	.total_items = NULL,
+	.play		= ct_play,
+	.pause		= ct_pause,
+	.stop		= ct_stop,
+	.next		= ct_next,
+	.previous	= ct_previous,
 };
 
 static int mcp_probe(struct btd_service *service)
@@ -342,7 +316,8 @@ static int mcp_accept(struct btd_service *service)
 
 	bt_mcp_attach(data->mcp, client);
 
-	data->mp = media_player_controller_create(device_get_path(device), 0);
+	data->mp = media_player_controller_create(device_get_path(device),
+							"mcp", 0);
 	if (data->mp == NULL) {
 		DBG("Unable to create Media Player");
 		return -EINVAL;
